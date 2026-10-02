@@ -1,0 +1,18 @@
+language = "he"
+concurrency = 1
+
+[channel]
+type = "folder"
+inbox = "./inbox"
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+device = "auto"
+compute_type = "int8_float16"
+
+[policy]
+open = true            # deny-by-default otherwise; set allow_chats / allow_senders instead
+# allow_chats = ["120363...@g.us"]
+# allow_senders = ["972...@c.us"]
+# max_duration_s = 300

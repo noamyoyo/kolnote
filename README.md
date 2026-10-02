@@ -1,0 +1,186 @@
+# kolnote
+
+Voice note in, text out. A self-hosted speech-to-text bridge: someone sends a voice message,
+kolnote transcribes it locally and replies in the same chat. The chat medium and the speech
+engine are both swappable adapters, so nothing is tied to one messenger or one vendor.
+
+Built and benchmarked for Hebrew (using the [ivrit.ai](https://huggingface.co/ivrit-ai) Whisper
+models), but it works for any language Whisper supports. Audio never leaves your machine.
+
+```
+ Channel adapter  ->  Policy  ->  STT adapter  ->  Channel adapter (reply)
+ WhatsApp, folder,    allowlist   faster-whisper,   same chat, as plain text
+ your own ...                     HTTP API, ...
+```
+
+The core (`pipeline.py`) only knows the two contracts in `ports.py`. Adding a messenger or an
+engine means writing one small class.
+
+## Status
+
+Proof of concept, used daily on one setup. Working today:
+
+- Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway), `folder` (drop files in, get `.txt` out).
+- STT engines: `faster_whisper` (local, GPU or CPU) and `openai_compat` (any `/v1/audio/transcriptions` server).
+- Deny-by-default allowlist, benchmark tool (WER/CER/speed), Docker image.
+
+Not done yet: a Telegram channel (the contract is ready, contributions welcome), a model
+preload option, and measuring audio length when the gateway does not report it.
+
+## Quick start (no chat account needed)
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[faster-whisper,dev]'
+cp config.example.toml config.toml
+.venv/bin/kolnote run -c config.toml      # drop audio files into ./inbox, get <name>.txt back
+```
+
+The first run downloads the model from Hugging Face. Run the tests with `.venv/bin/pytest`.
+
+## WhatsApp with OpenWA
+
+kolnote talks to WhatsApp through an OpenWA gateway (a self-hosted REST/webhook layer over the
+Baileys WhatsApp Web engine). kolnote receives webhooks and replies over REST.
+
+Install the HTTP extra first: `pip install -e '.[faster-whisper,http]'`.
+
+1. Run OpenWA and pair a WhatsApp number with a session. Use a separate number or account for
+   the bot, not your personal one.
+2. Create a webhook in OpenWA for the `message.received` event, pointing at
+   `http://<kolnote-host>:8765/webhook`, with a secret of your choice. Optionally filter it to
+   the chats you want. OpenWA signs each request with `X-OpenWA-Signature: sha256=<hmac>`;
+   kolnote rejects anything unsigned or wrongly signed, and refuses to start without a secret.
+3. Create an API key for kolnote. Scope it to the one session and the chats it should serve
+   (`allowedSessions`, `allowedChats`), not your master key.
+4. Copy `configs/openwa.example.toml`, fill in the gateway URL and session id, and set the two
+   secrets as environment variables (never in the file):
+
+```bash
+export KOLNOTE_CHANNEL__API_KEY=...
+export KOLNOTE_CHANNEL__WEBHOOK_SECRET=...
+kolnote run -c configs/openwa.toml
+```
+
+Behavior in an allowed chat:
+
+- A voice note gets a read receipt, then the transcript as a text reply.
+- Any other message (text, image, sticker, ...) gets a short "I can only transcribe voice
+  notes" reply. Change the wording with `unsupported_text`, or set it to `""` to stay silent.
+- The bot's own messages and non-message events are ignored, so it cannot reply to itself.
+- Repeated deliveries of the same webhook are deduplicated.
+
+The reply is sent as plain text, not as a quoted reply, because a chat-restricted OpenWA key is
+not allowed to quote.
+
+Note: Baileys-based gateways use an unofficial WhatsApp Web connection. Use a dedicated number
+and understand that WhatsApp's terms do not endorse this.
+
+## Docker
+
+```bash
+docker build -t kolnote .
+docker run -d --name kolnote --gpus all \
+  -p 8765:8765 \
+  -e KOLNOTE_CHANNEL__API_KEY -e KOLNOTE_CHANNEL__WEBHOOK_SECRET \
+  -v "$PWD/models:/models" -v "$PWD/configs:/configs:ro" \
+  kolnote run -c /configs/openwa.toml
+```
+
+`--gpus all` needs the NVIDIA Container Toolkit. Model files are cached in `/models`, so mount
+a volume there. If the gateway runs in Docker too, put both on the same network and use the
+gateway's container name as `base_url`. Publish port 8765 only to a network the gateway can
+reach, not the open internet.
+
+## Configuration
+
+A TOML file, or environment variables, or both. Environment wins. Every key maps to
+`KOLNOTE_<SECTION>__<KEY>`, for example:
+
+```bash
+KOLNOTE_STT__MODEL=large-v3
+KOLNOTE_POLICY__ALLOW_CHATS="1203...@g.us,1204...@g.us"   # lists are comma separated
+KOLNOTE_LANGUAGE=he
+```
+
+Secrets belong in environment variables. See `config.example.toml` and `configs/`.
+
+| Key | Meaning |
+|-----|---------|
+| `language` | Whisper language code such as `he` or `en`. Omit to auto-detect. |
+| `concurrency` | Notes transcribed in parallel (default 1; the model runs one at a time anyway). |
+| `unsupported_text` | Reply for non-voice messages. Empty string disables it. |
+| `[channel]` / `[stt]` | `type` plus that adapter's options. |
+| `[policy]` | Who may use the bot, see below. |
+
+## Access control
+
+Deny-by-default. A message is accepted if its chat is in `allow_chats` **or** its sender is in
+`allow_senders`. Listing a group in `allow_chats` therefore admits everyone in that group. Set
+`open = true` only if you really want anyone. `max_duration_s` rejects long notes.
+
+## Adapters
+
+| Kind | `type` | Options |
+|------|--------|---------|
+| channel | `openwa` | `base_url`, `session_id`, `api_key`, `webhook_secret`, `host`, `port`, `path`, `timeout_s`, `mark_read` |
+| channel | `folder` | `inbox`, `poll_s`, `once` |
+| stt | `faster_whisper` | `model` (any CTranslate2 model id or path), `device`, `compute_type`, `beam_size`, `vad_filter`, `initial_prompt`, `cpu_threads`, `download_root` |
+| stt | `openai_compat` | `base_url`, `model`, `api_key_env`, `timeout_s` (needs `.[http]`) |
+
+Write your own: implement the `Channel` or `STTEngine` protocol from `src/kolnote/ports.py`
+(`from_config`, then `messages`/`reply`/`close` or `transcribe`/`close`) and reference it as
+`type = "yourpkg.module:YourClass"`. No registration step.
+
+## Benchmarks
+
+Scored on [`ivrit-ai/eval-whatsapp`](https://huggingface.co/datasets/ivrit-ai/eval-whatsapp):
+54 real Hebrew WhatsApp voice notes with reference transcripts. RTX 3080, `int8_float16`, beam
+size 5, power-capped to 150 W.
+
+| Model | WER | CER | Real-time factor |
+|-------|-----|-----|------------------|
+| `large-v3-turbo` (stock Whisper) | 13.4% | 5.9% | 0.03 |
+| `ivrit-ai/whisper-large-v3-turbo-ct2` | 7.6% | 3.6% | 0.04 |
+| `ivrit-ai/whisper-large-v3-ct2` | 6.8% | 3.3% | 0.27 |
+
+WER is word error rate and CER is character error rate (lower is better), computed over the
+whole corpus after stripping Hebrew vowel points and punctuation. Real-time factor is
+processing time divided by audio length, so 0.04 means 25 times faster than real time.
+
+The Hebrew fine-tune roughly halves the error rate against stock Whisper at the same speed.
+The full large-v3 model is a little more accurate but about seven times slower, so the turbo
+model is the default. In live use the turbo model transcribed an 8 s note in about 0.7 s once
+loaded. The first note after a start takes longer because the model loads lazily.
+
+Run it on your own audio (audio files plus same-named `.txt` references):
+
+```bash
+kolnote bench --dataset datasets/my-set \
+  --stt configs/stock-turbo.toml --stt configs/ivrit-turbo.toml --out bench-results/run.json
+```
+
+The eval-whatsapp dataset is gated and licensed for training or academic research. It is not
+included here; request access on Hugging Face yourself.
+
+## Hardware
+
+- The turbo model at `int8_float16` uses about 1.3 GB of VRAM. Measured on an RTX 3080.
+- GPUs older than Volta (for example a GTX 1080 Ti) have no tensor cores. Use
+  `compute_type = "int8"` there. This is expected to work but has not been tested.
+- CPU works (`device = "cpu"`) but is much slower.
+
+`scripts/gpu-guard.sh <container>` is an optional watchdog we use on a card with weak cooling:
+it pauses a container at 78 C, resumes at 70 C, and kills it at 88 C or on a GPU error. Adjust
+the thresholds to your hardware before using it.
+
+## Privacy
+
+Transcription runs locally. The only network traffic is the model download from Hugging Face
+and the calls to your own gateway. Transcript text is not written to the logs; they record
+sender, audio length, timings and character counts. Voice notes are processed in memory and not
+stored.
+
+## License
+
+MIT, see `LICENSE`. The ivrit.ai models and any dataset you use have their own licenses.

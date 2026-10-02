@@ -1,0 +1,9 @@
+.venv
+.git
+tests
+datasets
+models
+bench-results
+config.toml
+*.local.toml
+**/__pycache__

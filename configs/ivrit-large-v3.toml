@@ -1,0 +1,8 @@
+language = "he"
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-ct2"
+device = "auto"
+compute_type = "int8_float16"
+beam_size = 5
