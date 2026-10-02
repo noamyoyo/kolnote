@@ -20,12 +20,13 @@ engine means writing one small class.
 
 Proof of concept, used daily on one setup. Working today:
 
-- Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway, tested live), `telegram` (Bot API, [see below](#telegram), tested against a mocked API only), `folder` (drop files in, get `.txt` out).
+- Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway, tested live), `telegram` (Bot API, [see below](#telegram), tested live), `folder` (drop files in, get `.txt` out).
 - STT engines: `faster_whisper` (local, GPU or CPU) and `openai_compat` (any `/v1/audio/transcriptions` server).
 - Deny-by-default allowlist, benchmark tool (WER/CER/speed), Docker image.
 
-Not done yet: a live-tested Telegram run, running several channels in one process, a model
-preload option, and measuring audio length when the gateway does not report it.
+Not done yet: running several channels in one process, a model preload option, and measuring
+audio length when the gateway does not report it. How it is built is in
+[docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start (no chat account needed)
 
