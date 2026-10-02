@@ -10,7 +10,9 @@
 #
 # The WhatsApp webhook port is published on loopback only; publish it on the network your OpenWA
 # gateway is on instead if the gateway runs elsewhere. The Wyoming port has no authentication:
-# publish it on a trusted network only.
+# publish it on a trusted network only. base_url of the WhatsApp channel must resolve from this
+# container: run OpenWA as a service in this file, or add a `networks:` entry with the network
+# OpenWA is on.
 
 services:
   kolnote:
