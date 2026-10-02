@@ -20,11 +20,11 @@ engine means writing one small class.
 
 Proof of concept, used daily on one setup. Working today:
 
-- Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway), `folder` (drop files in, get `.txt` out).
+- Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway, tested live), `telegram` (Bot API, [see below](#telegram), tested against a mocked API only), `folder` (drop files in, get `.txt` out).
 - STT engines: `faster_whisper` (local, GPU or CPU) and `openai_compat` (any `/v1/audio/transcriptions` server).
 - Deny-by-default allowlist, benchmark tool (WER/CER/speed), Docker image.
 
-Not done yet: a Telegram channel (the contract is ready, contributions welcome), a model
+Not done yet: a live-tested Telegram run, running several channels in one process, a model
 preload option, and measuring audio length when the gateway does not report it.
 
 ## Quick start (no chat account needed)
@@ -38,7 +38,16 @@ cp config.example.toml config.toml
 
 The first run downloads the model from Hugging Face. Run the tests with `.venv/bin/pytest`.
 
-## WhatsApp with OpenWA
+## Activating a channel
+
+One kolnote process serves one channel. To run two (say WhatsApp and Telegram), start two
+processes or containers with different configs. They can share one GPU; each loads its own
+copy of the model (about 1.3 GB of VRAM for the turbo model).
+
+Every channel needs an allowlist before it answers anyone (see [Access control](#access-control)).
+With an empty `[policy]` the bot ignores everything.
+
+### WhatsApp with OpenWA
 
 kolnote talks to WhatsApp through an OpenWA gateway (a self-hosted REST/webhook layer over the
 Baileys WhatsApp Web engine). kolnote receives webhooks and replies over REST.
@@ -53,8 +62,9 @@ Install the HTTP extra first: `pip install -e '.[faster-whisper,http]'`.
    kolnote rejects anything unsigned or wrongly signed, and refuses to start without a secret.
 3. Create an API key for kolnote. Scope it to the one session and the chats it should serve
    (`allowedSessions`, `allowedChats`), not your master key.
-4. Copy `configs/openwa.example.toml`, fill in the gateway URL and session id, and set the two
-   secrets as environment variables (never in the file):
+4. Copy `configs/openwa.example.toml`, fill in the gateway URL, session id and the chat ids in
+   `allow_chats` (group ids look like `1203...@g.us`), and set the two secrets as environment
+   variables (never in the file):
 
 ```bash
 export KOLNOTE_CHANNEL__API_KEY=...
@@ -65,16 +75,65 @@ kolnote run -c configs/openwa.toml
 Behavior in an allowed chat:
 
 - A voice note gets a read receipt, then the transcript as a text reply.
-- Any other message (text, image, sticker, ...) gets a short "I can only transcribe voice
-  notes" reply. Change the wording with `unsupported_text`, or set it to `""` to stay silent.
+- Any other message (text, image, sticker, a file sent as a document, ...) gets a short "I can
+  only transcribe voice notes" reply. Change the wording with `unsupported_text`, or set it to
+  `""` to stay silent.
 - The bot's own messages and non-message events are ignored, so it cannot reply to itself.
 - Repeated deliveries of the same webhook are deduplicated.
 
-The reply is sent as plain text, not as a quoted reply, because a chat-restricted OpenWA key is
-not allowed to quote.
+Caveats:
 
-Note: Baileys-based gateways use an unofficial WhatsApp Web connection. Use a dedicated number
-and understand that WhatsApp's terms do not endorse this.
+- **Docker networking.** If kolnote runs in Docker, the gateway's public hostname often does
+  not resolve from inside the container. Put both on one Docker network and set
+  `KOLNOTE_CHANNEL__BASE_URL=http://<gateway-container-name>:<port>`. A wrong URL shows up as
+  `ConnectError: Name or service not known` when the bot tries to reply.
+- **Unofficial connection.** Baileys-based gateways use an unofficial WhatsApp Web connection.
+  Use a dedicated number; WhatsApp's terms do not endorse this.
+- **No duration limit.** The gateway does not report audio length, so `max_duration_s` is not
+  enforced on WhatsApp. Log lines show `audio=0.0s` for this reason.
+- **Plain replies.** The reply is sent as plain text, not as a quoted reply, because a
+  chat-restricted OpenWA key is not allowed to quote.
+- **Webhook port.** Publish port 8765 only to a network the gateway can reach, never the open
+  internet. The signature check is the only thing between that port and the bot.
+
+### Telegram
+
+1. Open @BotFather in Telegram, send `/newbot`, and choose a name and a username ending in
+   `bot`. BotFather replies with a token.
+2. Find the ids you want to allow. For a private chat use your own numeric user id (ask
+   @userinfobot). For a group, use the group id, which is negative (for example
+   `-100123456789`).
+3. Copy `configs/telegram.example.toml` and put those ids in `allow_senders` (people) or
+   `allow_chats` (chats; a group here admits everyone in it).
+4. Pass the token as an environment variable (never in the file) and run:
+
+```bash
+export KOLNOTE_CHANNEL__TOKEN=123456:ABC...
+kolnote run -c configs/telegram.toml
+```
+
+Then open a chat with the bot, press Start, and send a voice note. Telegram bots cannot message
+you first, so the chat has to exist before the bot can answer.
+
+The bot long-polls Telegram, so it needs no public URL or open port. It replies to the voice
+note it is answering, shows a "typing" indicator while it works, and splits transcripts longer
+than 4096 characters. Text, photos, stickers and other non-voice messages get the "I can only
+transcribe voice notes" reply. `max_duration_s` works on Telegram because it reports the length.
+
+Caveats:
+
+- **Group privacy.** In groups the bot only sees voice notes if privacy mode is off
+  (BotFather `/setprivacy`, then Disable) or the bot is a group admin. Remove and re-add the bot
+  to the group after changing it.
+- **One poller per token.** Two processes polling the same bot, or a webhook set on the bot,
+  make Telegram answer with a conflict error and nobody gets updates reliably.
+- **The token is a password.** It is part of every Telegram API URL. kolnote turns off HTTP
+  request logging and never logs exception text for Telegram calls, but do not enable debug
+  logging of HTTP traffic. If a token leaks, send `/revoke` to BotFather and use the new one.
+- **Not end-to-end encrypted.** Bot chats are ordinary cloud chats, so Telegram can read the
+  audio. Transcription still runs locally; the audio only leaves your server as the user's own
+  message to Telegram.
+- **Size limit.** Bots can download files up to 20 MB.
 
 ## Docker
 
@@ -91,6 +150,9 @@ docker run -d --name kolnote --gpus all \
 a volume there. If the gateway runs in Docker too, put both on the same network and use the
 gateway's container name as `base_url`. Publish port 8765 only to a network the gateway can
 reach, not the open internet.
+
+For Telegram, drop the `-p` flag (it polls outbound), pass `-e KOLNOTE_CHANNEL__TOKEN`, and use a
+Telegram config.
 
 ## Configuration
 
@@ -124,13 +186,16 @@ Deny-by-default. A message is accepted if its chat is in `allow_chats` **or** it
 | Kind | `type` | Options |
 |------|--------|---------|
 | channel | `openwa` | `base_url`, `session_id`, `api_key`, `webhook_secret`, `host`, `port`, `path`, `timeout_s`, `mark_read` |
+| channel | `telegram` | `token`, `api_base`, `poll_timeout_s`, `typing` |
 | channel | `folder` | `inbox`, `poll_s`, `once` |
 | stt | `faster_whisper` | `model` (any CTranslate2 model id or path), `device`, `compute_type`, `beam_size`, `vad_filter`, `initial_prompt`, `cpu_threads`, `download_root` |
 | stt | `openai_compat` | `base_url`, `model`, `api_key_env`, `timeout_s` (needs `.[http]`) |
 
-Write your own: implement the `Channel` or `STTEngine` protocol from `src/kolnote/ports.py`
-(`from_config`, then `messages`/`reply`/`close` or `transcribe`/`close`) and reference it as
-`type = "yourpkg.module:YourClass"`. No registration step.
+Write your own, for another messenger or a second WhatsApp gateway: see
+[docs/ADDING-A-CHANNEL.md](docs/ADDING-A-CHANNEL.md). A channel is one small class; the core
+does the allowlist, transcription and reply. Select it with a built-in name, a package entry
+point (`kolnote.channels`), or `type = "yourpkg.module:YourClass"`. `kolnote.testing.check_channel`
+checks your adapter against the contract.
 
 ## Benchmarks
 

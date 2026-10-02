@@ -1,0 +1,15 @@
+language = "he"
+
+[channel]
+type = "telegram"
+# token: set KOLNOTE_CHANNEL__TOKEN (from @BotFather), never put it in this file
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+device = "auto"
+compute_type = "int8_float16"             # use "int8" on GPUs without tensor cores (pre-Volta)
+
+[policy]
+allow_chats = ["-100123456789"]           # Telegram chat ids; group ids are negative
+max_duration_s = 600

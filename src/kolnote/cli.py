@@ -58,6 +58,7 @@ def main() -> None:
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # request URLs can contain bot tokens
     if args.command == "run":
         asyncio.run(_run(args.config))
     else:
