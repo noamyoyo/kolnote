@@ -1,0 +1,27 @@
+# Several channels in one process, one copy of the model.
+#   kolnote run -c configs/multi.example.toml
+# Secrets come from the environment:
+#   KOLNOTE_CHANNELS__TELEGRAM__TOKEN, KOLNOTE_CHANNELS__WHATSAPP__API_KEY,
+#   KOLNOTE_CHANNELS__WHATSAPP__WEBHOOK_SECRET
+language = "he"
+
+[channels.telegram]                        # type defaults to the table name
+[channels.telegram.policy]
+allow_senders = ["123456789"]              # Telegram user ids
+max_duration_s = 600
+
+[channels.whatsapp]
+type = "openwa"
+base_url = "http://openwa:2785"            # your OpenWA gateway
+session_id = "00000000-0000-0000-0000-000000000000"
+host = "0.0.0.0"
+port = 8765
+[channels.whatsapp.policy]
+allow_chats = ["120363000000000000@g.us"]  # a group admits everyone in it
+max_duration_s = 600
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+compute_type = "int8_float16"              # use "int8" on GPUs without tensor cores (pre-Volta)
+idle_unload_s = 300                        # free the VRAM after 5 idle minutes; 0 keeps the model loaded

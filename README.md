@@ -22,10 +22,13 @@ Proof of concept, used daily on one setup. Working today:
 
 - Channels: `openwa` (WhatsApp through an [OpenWA](#whatsapp-with-openwa) gateway, tested live), `telegram` (Bot API, [see below](#telegram), tested live), `folder` (drop files in, get `.txt` out).
 - STT engines: `faster_whisper` (local, GPU or CPU) and `openai_compat` (any `/v1/audio/transcriptions` server).
+- Several channels in one process sharing one model, with optional idle unload to free GPU memory, see [Several channels, one model](#several-channels-one-model).
+- Several models in one process (`type = "multi"`), chosen by language, with always-warm and on-demand models, see [Several models, one GPU](#several-models-one-gpu).
+- A Wyoming speech-to-text server, so Home Assistant can use the same process, see [Home Assistant (Wyoming)](#home-assistant-wyoming).
+- `kolnote serve`: expose the model to other programs over the OpenAI transcription API, see [Sharing the model with other programs](#sharing-the-model-with-other-programs).
 - Deny-by-default allowlist, benchmark tool (WER/CER/speed), Docker image.
 
-Not done yet: running several channels in one process, a model preload option, and measuring
-audio length when the gateway does not report it. How it is built is in
+Not done yet: measuring audio length when the gateway does not report it. How it is built is in
 [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start (no chat account needed)
@@ -41,9 +44,8 @@ The first run downloads the model from Hugging Face. Run the tests with `.venv/b
 
 ## Activating a channel
 
-One kolnote process serves one channel. To run two (say WhatsApp and Telegram), start two
-processes or containers with different configs. They can share one GPU; each loads its own
-copy of the model (about 1.3 GB of VRAM for the turbo model).
+A config with a `[channel]` section runs one channel. To run several (say WhatsApp and Telegram)
+in one process, with one copy of the model, see [Several channels, one model](#several-channels-one-model).
 
 Every channel needs an allowlist before it answers anyone (see [Access control](#access-control)).
 With an empty `[policy]` the bot ignores everything.
@@ -136,6 +138,186 @@ Caveats:
   message to Telegram.
 - **Size limit.** Bots can download files up to 20 MB.
 
+## Several channels, one model
+
+Name each channel under `[channels.<name>]` instead of `[channel]`. One `kolnote run` process
+serves all of them with a single model:
+
+```
+ telegram ──┐
+ whatsapp ──┼──▶ kolnote run ──▶ faster-whisper (one copy in memory)
+ folder   ──┘
+```
+
+```toml
+language = "he"
+
+[channels.telegram]                     # type defaults to the name
+[channels.telegram.policy]
+allow_senders = ["123456789"]
+
+[channels.whatsapp]
+type = "openwa"
+base_url = "http://openwa:2785"
+session_id = "..."
+[channels.whatsapp.policy]
+allow_chats = ["1203...@g.us"]
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+compute_type = "int8_float16"
+idle_unload_s = 300
+```
+
+See [`configs/multi.example.toml`](configs/multi.example.toml). Secrets stay in the environment,
+for example `KOLNOTE_CHANNELS__TELEGRAM__TOKEN` and `KOLNOTE_CHANNELS__WHATSAPP__API_KEY`. Each
+channel has its own `policy` (a channel without one uses the top-level `[policy]`). Do not mix
+`[channel]` and `[channels.*]` in one config.
+
+- **One request at a time.** The model transcribes one note at a time, so notes from different
+  channels queue. A short note takes about a second once the model is loaded.
+- **One failure stops all.** If one channel's connection dies for good, the process exits and
+  Docker's restart policy brings it back. Run separate containers if you want them isolated.
+- **Sharing a GPU.** `idle_unload_s` frees the model and its VRAM after that many seconds without
+  a note. The next note reloads it, which takes 5 to 30 s depending on the disk. Use it when
+  something else (another model, a voice assistant) needs the card most of the time. The default
+  is 0: keep the model loaded.
+
+[`docker-compose.example.yml`](docker-compose.example.yml) runs channels, the Wyoming server and
+several models as one container (see [Docker](#docker)).
+
+## Several models, one GPU
+
+One model rarely fits everything. A Hebrew fine-tune is good at Hebrew and poor at English; the
+stock model is the other way round. `type = "multi"` holds several models and picks one per
+request by language. It also decides which models stay in memory, so a small GPU can serve both.
+
+```toml
+[stt]
+type = "multi"
+default = "en"          # used when the language matches no model
+exclusive = true        # keep at most one model in memory (see below)
+
+[stt.models.en]
+type = "faster_whisper"
+model = "large-v3-turbo"
+compute_type = "int8_float16"
+languages = ["en"]
+keep_warm = true        # loaded at start, reloaded whenever it is evicted
+
+[stt.models.he]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+compute_type = "int8_float16"
+languages = ["he"]
+idle_unload_s = 300     # loaded on the first Hebrew note, dropped after 5 idle minutes
+```
+
+See [`configs/multi-model.example.toml`](configs/multi-model.example.toml) for a complete file with
+channels. Each `[stt.models.<name>]` is a normal engine config (any `type`, any option) plus the
+routing keys below.
+
+| Key | Where | Meaning |
+|-----|-------|---------|
+| `default` | `[stt]` | Model used when the request's language matches no model, or has none. Defaults to the first model in the file. |
+| `exclusive` | `[stt]` | `true`: at most one model in memory at a time. Default `false`. |
+| `languages` | model | Language codes this model serves. `en-US` and `en_US` count as `en`. One code per language, across all models. |
+| `keep_warm` | model | Load at start and keep loaded. |
+| `idle_unload_s` | model | Unload after this many seconds without a request. The model loads again on demand. |
+
+How it behaves:
+
+- **Routing.** The language comes from the channel's top-level `language`, from the Wyoming
+  client, or from a request. A model with exactly one language uses it when the request names none.
+- **Always warm, on demand.** `keep_warm` models are loaded when the process starts. Other models
+  load on their first request and unload when their `idle_unload_s` runs out. A model with
+  neither is loaded on demand and stays loaded.
+- **Exclusive mode.** Serving a request for one model first unloads the others. When an
+  on-demand model times out, the router unloads it and loads the `keep_warm` models back, so the
+  card returns to its resting state without a request. When at least one model is `keep_warm`,
+  every other model needs an `idle_unload_s`, otherwise nothing would ever bring the warm model
+  back. Use it when the models together do not fit next to whatever else uses the GPU.
+- **The first request after a swap is slow.** It waits for the load: a few seconds with the
+  weights in the OS page cache, up to about 30 s from a cold disk.
+- **One request at a time.** The router serializes requests and model changes.
+- **Mistakes fail at start.** An unknown `default`, a language claimed by two models, `keep_warm`
+  together with `idle_unload_s`, or the exclusive-mode rule above stops the process with a message.
+
+With `multi`, set `idle_unload_s` per model. Under `[stt]` itself only `default`, `exclusive` and
+`models` are accepted; anything else stops the process with an error.
+
+## Home Assistant (Wyoming)
+
+Home Assistant's voice pipeline talks to speech-to-text servers over the
+[Wyoming protocol](https://github.com/OHF-Voice/wyoming). A `[wyoming]` section makes `kolnote
+run` listen as one, in the same process and with the same engine as the chat channels. A note
+that arrives over WhatsApp and a question spoken to Home Assistant use one set of models.
+
+```toml
+[wyoming]
+host = "0.0.0.0"      # default 127.0.0.1
+port = 10300          # default 10300
+```
+
+Install the extra (`pip install -e '.[faster-whisper,wyoming]'`; the `full` Docker target
+includes it). In Home Assistant, add the Wyoming Protocol integration with the host and port, then
+choose it as the speech-to-text engine of a voice assistant.
+
+- **What it advertises.** With `type = "multi"`, one model per `[stt.models.*]` entry, with its
+  languages. Home Assistant sends the assistant's language and kolnote routes on it. With a
+  single engine, set `languages = ["en"]` under `[wyoming]` (or the top-level `language`).
+- **Audio.** Home Assistant streams raw PCM. kolnote wraps it as WAV and passes it to the engine;
+  the reply is the transcript.
+- **Failures.** If the engine fails, Home Assistant gets an empty transcript instead of a hang.
+- **No authentication.** Wyoming has none. Bind to a trusted network only.
+- **Latency matters here.** A voice assistant waits for the answer. Keep the model Home Assistant
+  uses in `keep_warm`, and put slower, rarer models (a large Hebrew model, say) on demand.
+  A request that needs a cold load can be slower than the client's timeout allows.
+- **Only `[wyoming]` is enough to run.** A config with `[wyoming]` and no channels is valid.
+- **A `multi` setup for Home Assistant plus voice notes** (English warm for the assistant, Hebrew
+  on demand for notes, exclusive on a small GPU) is the example in
+  [`configs/multi-model.example.toml`](configs/multi-model.example.toml).
+
+## Sharing the model with other programs
+
+`kolnote serve` exposes the `[stt]` engine over the OpenAI transcription API, so other programs
+(or other kolnote processes with `[stt] type = "openai_compat"`) can use one loaded model. You do
+not need it for the setup above. Start it with
+`STT_API_KEY=... kolnote serve -c configs/server.example.toml`. It loads the model at start
+(`preload = true`) and answers `POST /v1/audio/transcriptions` and `GET /healthz`. The `server`
+Docker target runs it.
+
+Server options, in the `[server]` section (or `KOLNOTE_SERVER__<KEY>`). The engine comes from
+`[stt]`, and the top-level `language` is the default when a request does not send one:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `host` | `127.0.0.1` | Address to listen on. Use `0.0.0.0` only in a container or on a trusted network. |
+| `port` | `8000` | Port. |
+| `preload` | `true` | Load the model at start instead of on the first request. |
+| `api_key_env` | none | Name of the environment variable that holds the API key. Without it there is no authentication. |
+| `max_body_mb` | `64` | Largest accepted upload. |
+
+What to know:
+
+- **Authentication.** With `api_key_env` set, requests need `Authorization: Bearer <key>`. The
+  key stops other machines or containers that can reach the port from using your GPU. It is
+  optional on `127.0.0.1` or on a private container network with no published port. If the
+  server listens on anything else without a key it logs a warning. `/healthz` never needs a key.
+- **One request at a time.** Simultaneous requests queue.
+- **Shared settings.** Beam size, VAD, prompt and language default live on the server and apply
+  to every client. A request can override only `language`.
+- **If the server is down** a kolnote client replies "Transcription failed." (`error_text`) and
+  keeps running.
+- **API compatibility.** The server implements `file`, `language` and `response_format`
+  (`json` or `text`) of OpenAI's transcription endpoint. `model` is accepted and ignored: it
+  always uses the engine it started with.
+
+`openai_compat` is not tied to `kolnote serve`. In principle it works against any server that
+speaks the same endpoint (OpenAI, Groq, a whisper.cpp server, Speaches). Only `kolnote serve`
+has been tested here.
+
 ## Docker
 
 ```bash
@@ -153,7 +335,20 @@ gateway's container name as `base_url`. Publish port 8765 only to a network the 
 reach, not the open internet.
 
 For Telegram, drop the `-p` flag (it polls outbound), pass `-e KOLNOTE_CHANNEL__TOKEN`, and use a
-Telegram config.
+Telegram config. For several channels in one container, use a `[channels.*]` config (see
+[Several channels, one model](#several-channels-one-model)) or the compose example.
+
+The Dockerfile has three targets. `docker build .` builds the last one, `full`: the bot with a
+local model, as above.
+
+| Target | Contains | Use for |
+|--------|----------|---------|
+| `full` (default) | bots, Wyoming server, faster-whisper, CUDA libraries | one container with every channel, the model and Home Assistant's speech-to-text |
+| `server` | faster-whisper, CUDA libraries, runs `kolnote serve` | exposing the model to other programs |
+| `channel` | bots and `httpx` only, no model, no GPU | channels that call a remote STT server |
+
+Build one with `docker build --target channel -t kolnote-channel .`. With `[wyoming]` enabled,
+publish its port too, for example `-p 10300:10300`.
 
 ## Configuration
 
@@ -173,7 +368,11 @@ Secrets belong in environment variables. See `config.example.toml` and `configs/
 | `language` | Whisper language code such as `he` or `en`. Omit to auto-detect. |
 | `concurrency` | Notes transcribed in parallel (default 1; the model runs one at a time anyway). |
 | `unsupported_text` | Reply for non-voice messages. Empty string disables it. |
+| `loading_text` | Reply sent before the transcript when the note has to wait for a model to load (cold start). Empty string disables it. |
 | `[channel]` / `[stt]` | `type` plus that adapter's options. |
+| `[channels.<name>]` | Several channels at once, each with its own optional `policy`. Replaces `[channel]`. |
+| `[wyoming]` | Also listen as a Wyoming speech-to-text server, see [Home Assistant (Wyoming)](#home-assistant-wyoming). Keys: `host`, `port`, `languages`. |
+| `[server]` | Only for `kolnote serve`, see [Sharing the model with other programs](#sharing-the-model-with-other-programs). |
 | `[policy]` | Who may use the bot, see below. |
 
 ## Access control
@@ -191,6 +390,7 @@ Deny-by-default. A message is accepted if its chat is in `allow_chats` **or** it
 | channel | `folder` | `inbox`, `poll_s`, `once` |
 | stt | `faster_whisper` | `model` (any CTranslate2 model id or path), `device`, `compute_type`, `beam_size`, `vad_filter`, `initial_prompt`, `cpu_threads`, `download_root` |
 | stt | `openai_compat` | `base_url`, `model`, `api_key_env`, `timeout_s` (needs `.[http]`) |
+| stt | `multi` | `default`, `exclusive`, and `[stt.models.<name>]` tables, see [Several models, one GPU](#several-models-one-gpu) |
 
 Write your own, for another messenger or a second WhatsApp gateway: see
 [docs/ADDING-A-CHANNEL.md](docs/ADDING-A-CHANNEL.md). A channel is one small class; the core
@@ -217,7 +417,9 @@ processing time divided by audio length, so 0.04 means 25 times faster than real
 The Hebrew fine-tune roughly halves the error rate against stock Whisper at the same speed.
 The full large-v3 model is a little more accurate but about seven times slower, so the turbo
 model is the default. In live use the turbo model transcribed an 8 s note in about 0.7 s once
-loaded. The first note after a start takes longer because the model loads lazily.
+loaded. Without `preload` the first note after a start takes 25 to 35 s because the model loads
+lazily; `kolnote serve` preloads by default. With `idle_unload_s` the same delay applies after
+every idle period.
 
 Run it on your own audio (audio files plus same-named `.txt` references):
 
@@ -240,10 +442,14 @@ included here; request access on Hugging Face yourself.
 it pauses a container at 78 C, resumes at 70 C, and kills it at 88 C or on a GPU error. Adjust
 the thresholds to your hardware before using it.
 
+If the card is shared with another model, set `idle_unload_s` so kolnote gives its VRAM back when
+idle. Two models that together fill the card can make either one fail to load or fall back to the CPU.
+
 ## Privacy
 
-Transcription runs locally. The only network traffic is the model download from Hugging Face
-and the calls to your own gateway. Transcript text is not written to the logs; they record
+Transcription runs locally. The only network traffic is the model download from Hugging Face,
+the calls to your own gateway, and, if you use `kolnote serve` or `openai_compat`, the calls to
+that server (which carry the audio, so keep that link on a private network). Transcript text is not written to the logs; they record
 sender, audio length, timings and character counts. Voice notes are processed in memory and not
 stored.
 

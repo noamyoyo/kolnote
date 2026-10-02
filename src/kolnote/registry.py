@@ -21,6 +21,7 @@ CHANNELS: dict[str, str] = {
 STT_ENGINES: dict[str, str] = {
     "faster_whisper": "kolnote.adapters.stt.faster_whisper:FasterWhisperSTT",
     "openai_compat": "kolnote.adapters.stt.openai_compat:OpenAICompatSTT",
+    "multi": "kolnote.adapters.stt.multi:MultiSTT",
 }
 
 

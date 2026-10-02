@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Sequence
 
 from .models import Incoming, UnsupportedMessage
 from .policy import Policy
-from .ports import Channel, STTEngine
+from .ports import Channel, Service, STTEngine
 
 log = logging.getLogger("kolnote")
 
 NO_SPEECH = "(no speech detected)"
 UNSUPPORTED = "I can only transcribe voice notes. Please send a voice message."
+LOADING = "Loading the speech model, this note will take a few seconds longer."
 
 
 async def handle(
@@ -23,6 +25,7 @@ async def handle(
     language: str | None,
     error_text: str | None,
     unsupported_text: str | None = UNSUPPORTED,
+    loading_text: str | None = None,
 ) -> None:
     reason = policy.check(msg)
     if reason:
@@ -37,6 +40,12 @@ async def handle(
         "received %s/%s from %s audio=%.1fs %d bytes",
         msg.channel, msg.message_id, msg.sender_id, msg.duration_s or 0, len(msg.audio),
     )
+    needs_load = getattr(engine, "needs_load", None)
+    if loading_text and needs_load and needs_load(language):
+        try:
+            await channel.reply(msg, loading_text)
+        except Exception:
+            log.exception("could not send the loading notice for %s/%s", msg.channel, msg.message_id)
     try:
         transcript = await engine.transcribe(msg.audio, mime_type=msg.mime_type, language=language)
     except Exception:
@@ -52,19 +61,21 @@ async def handle(
     )
 
 
-async def run(
-    channel: Channel,
+async def run_channels(
+    channels: Sequence[tuple[Channel, Policy]],
     engine: STTEngine,
-    policy: Policy,
     *,
+    services: Sequence[Service] = (),
     language: str | None = None,
     concurrency: int = 1,
     error_text: str | None = "Transcription failed.",
     unsupported_text: str | None = UNSUPPORTED,
+    loading_text: str | None = None,
 ) -> None:
+    """Serve every channel and service with one shared engine. One of them failing stops them all."""
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def worker(msg: Incoming) -> None:
+    async def worker(msg: Incoming, channel: Channel, policy: Policy) -> None:
         async with semaphore:
             try:
                 await handle(
@@ -75,14 +86,46 @@ async def run(
                     language=language,
                     error_text=error_text,
                     unsupported_text=unsupported_text,
+                    loading_text=loading_text,
                 )
             except Exception:
                 log.exception("unhandled error for %s/%s", msg.channel, msg.message_id)
 
+    async def consume(channel: Channel, policy: Policy, tg: asyncio.TaskGroup) -> None:
+        async for msg in channel.messages():
+            tg.create_task(worker(msg, channel, policy))
+
     try:
         async with asyncio.TaskGroup() as tg:
-            async for msg in channel.messages():
-                tg.create_task(worker(msg))
+            for channel, policy in channels:
+                tg.create_task(consume(channel, policy, tg))
+            for service in services:
+                tg.create_task(service.serve_forever())
     finally:
-        await channel.close()
+        for channel, _ in channels:
+            await channel.close()
+        for service in services:
+            await service.close()
         await engine.close()
+
+
+async def run(
+    channel: Channel,
+    engine: STTEngine,
+    policy: Policy,
+    *,
+    language: str | None = None,
+    concurrency: int = 1,
+    error_text: str | None = "Transcription failed.",
+    unsupported_text: str | None = UNSUPPORTED,
+    loading_text: str | None = None,
+) -> None:
+    await run_channels(
+        [(channel, policy)],
+        engine,
+        language=language,
+        concurrency=concurrency,
+        error_text=error_text,
+        unsupported_text=unsupported_text,
+        loading_text=loading_text,
+    )

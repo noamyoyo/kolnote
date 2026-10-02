@@ -17,6 +17,94 @@ The core is the source of truth for behavior: who is allowed, what happens to no
 messages, how replies are logged, how errors are handled. A channel adapter only does the
 chat-specific parts: receive messages, fetch the audio, send text back.
 
+## Several channels, one model (`pipeline.run_channels`)
+
+`kolnote run` can host several channels in one process. `run_channels` takes a list of
+`(Channel, Policy)` pairs and one `STTEngine`. Each channel gets its own consumer task and its
+own policy; all of them share the engine and a semaphore, so the model sees one note at a time.
+
+```
+ telegram ─┐
+ openwa   ─┼─▶ run_channels ─▶ faster_whisper (one copy)
+ folder   ─┘
+```
+
+Config is `[channels.<name>]` tables (`type` defaults to the name, an optional `policy`
+sub-table). The tables map cleanly to `KOLNOTE_CHANNELS__<NAME>__<KEY>` env overrides, which a
+TOML array of tables would not. One channel failing ends the process: a half-working bot hides
+errors, and a restart policy is the simplest recovery. `pipeline.run` is the one-channel
+wrapper, so existing callers did not change.
+
+For a GPU shared with another model, `FasterWhisperSTT(idle_unload_s=...)` drops the model after
+that many idle seconds and loads it again on the next request.
+
+## Several models, one engine (`adapters/stt/multi.py`)
+
+`MultiSTT` is an `STTEngine` that wraps several other engines, so the core and the channels do not
+know there is more than one. It routes each request by language: the language is normalised to its
+first subtag (`en-US` becomes `en`), looked up in a table built from each model's `languages`, and
+falls back to `default`. A model with exactly one language receives it when the request names none,
+so a Hebrew-only model is never left to auto-detect.
+
+Lifecycle is the router's job, not the sub-engines'. It builds each sub-engine without
+`idle_unload_s` and runs its own timers, because "unload" alone is not enough in `exclusive` mode:
+when an on-demand model times out the router must also load the `keep_warm` models back. Sub-engines
+only need the optional `preload`, `unload` and `loaded` members; one without them is simply left alone.
+
+- `keep_warm` models load in `warm_up()`, which the CLI calls at start.
+- On-demand models load on their first request. `idle_unload_s` re-arms a timer after every request.
+- `exclusive = true` unloads every other model before serving one, which is what makes two models
+  fit on a card that holds one of them plus a second program.
+- A single lock serializes requests and lifecycle changes, so a timer firing mid-request cannot pull
+  the model out from under a running transcription.
+
+Combinations that cannot work are rejected when the config is read: an unknown `default`, a
+language claimed by two models, `keep_warm` with `idle_unload_s`, and, in exclusive mode with a warm
+model, an on-demand model without `idle_unload_s` (the warm model would never return).
+
+There is deliberately no CPU fallback. A model that does not fit is a configuration problem to
+solve with `exclusive` and on-demand loading, not a reason to silently run ten times slower.
+
+## Wyoming service (`wyoming_server.py`)
+
+Home Assistant's voice pipeline speaks the Wyoming protocol. `WyomingServer` is a small `Service`
+(see `ports.py`): an object with `serve_forever()` and `close()` that `run_channels` runs next to the
+channels in the same task group and closes in the same `finally`. A failure in any of them stops the
+process, as for channels. It shares the engine, so voice notes and Home Assistant use the same models.
+
+```
+ telegram ─┐
+ whatsapp ─┼─▶ run_channels ─▶ MultiSTT ─▶ en (warm) / he (on demand)
+ wyoming  ─┘
+```
+
+Per connection: `Describe` is answered with one ASR model per `multi` model (name and languages);
+`Transcribe` sets the language; `AudioChunk` PCM is buffered; `AudioStop` wraps the PCM as a WAV,
+calls `engine.transcribe`, replies with `Transcript` and ends the connection. An engine error becomes
+an empty transcript so the client does not wait for a timeout. The transcript text is never logged,
+only its length.
+
+The server uses `AsyncServer.start()` and waits on an event instead of `AsyncServer.run()`, because
+`run()` installs its own SIGTERM handler that stops only the Wyoming listener and leaves the rest of
+the process running.
+
+`wyoming` is an optional dependency (the `wyoming` extra), imported only when a `[wyoming]` section is
+present. A config with `[wyoming]` and no channels is valid.
+
+## Sharing the model with other programs (`server.py`)
+
+`kolnote serve` is a small HTTP server that exposes any `STTEngine` as OpenAI's
+`/v1/audio/transcriptions`. It is for programs outside the process (a Wyoming bridge, another
+kolnote with the `openai_compat` engine), not needed for several channels.
+
+```
+ other program ─▶ HTTP (OpenAI API) ─▶ kolnote serve ─▶ faster_whisper
+```
+
+The server is dependency-free, in the same style as the OpenWA webhook receiver: an asyncio
+socket server, the standard library's `email` parser for multipart bodies, and an optional
+bearer key.
+
 ## The two ports (`ports.py`)
 
 ```python
@@ -92,6 +180,9 @@ line.
   `folder` channel writes the `.txt` next to the input, by design). Transcripts are not logged.
 - Chat-scoped gateway keys are supported and recommended. A scoped OpenWA key cannot send quoted
   replies, so the OpenWA adapter sends plain replies.
+- `kolnote serve` listens on `127.0.0.1` by default and compares the bearer key in constant
+  time. It logs a warning when it listens on another address without a key. Error responses
+  never include exception text, and audio and transcripts are neither stored nor logged.
 
 ## Why this shape
 

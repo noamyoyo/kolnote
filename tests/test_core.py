@@ -102,6 +102,34 @@ def test_unsupported_message_gets_reply_but_only_when_allowed():
     assert ch.replies == ["voice only"]
 
 
+class ColdSTT(FakeSTT):
+    def __init__(self):
+        super().__init__()
+        self.cold = True
+
+    def needs_load(self, language=None):
+        return self.cold
+
+    async def transcribe(self, audio, *, mime_type, language):
+        self.cold = False
+        return await super().transcribe(audio, mime_type=mime_type, language=language)
+
+
+def test_loading_notice_is_sent_once_before_a_cold_transcript():
+    ch = FakeChannel([audio(), audio()])
+    run(ch, ColdSTT(), Policy(open=True), loading_text="loading")
+    assert ch.replies == ["loading", "שלום עולם", "שלום עולם"]
+
+
+def test_no_loading_notice_when_disabled_or_engine_cannot_say():
+    ch = FakeChannel([audio()])
+    run(ch, ColdSTT(), Policy(open=True), loading_text=None)
+    assert ch.replies == ["שלום עולם"]
+    ch = FakeChannel([audio()])
+    run(ch, FakeSTT(), Policy(open=True), loading_text="loading")
+    assert ch.replies == ["שלום עולם"]
+
+
 def test_unsupported_reply_can_be_disabled():
     ch = FakeChannel([UnsupportedMessage("fake", "c1", "m1", "s1", "image")])
     run(ch, FakeSTT(), Policy(open=True), unsupported_text=None)
@@ -140,3 +168,44 @@ def test_entry_point_plugins_are_found(monkeypatch):
     assert isinstance(build_channel({"type": "mine"}), FakeChannel)
     with pytest.raises(ValueError, match="mine"):
         build_channel({"type": "nope"})
+
+
+def test_run_channels_shares_engine_with_per_channel_policy():
+    a = FakeChannel([audio(chat="c1")])
+    b = FakeChannel([audio(chat="c2"), audio(chat="c1")])
+    engine = FakeSTT()
+    pols = [(a, Policy(allow_chats=frozenset({"c1"}))), (b, Policy(allow_chats=frozenset({"c2"})))]
+    asyncio.run(pipeline.run_channels(pols, engine))
+    assert a.replies == ["שלום עולם"]
+    assert b.replies == ["שלום עולם"]  # c1 on channel b is denied by b's own policy
+    assert a.closed and b.closed
+
+
+def test_run_channels_stops_everything_when_one_channel_fails():
+    class Broken(FakeChannel):
+        async def messages(self):
+            raise ConnectionError("gateway down")
+            yield
+
+    ok, bad = FakeChannel([]), Broken([])
+    with pytest.raises(ExceptionGroup):
+        asyncio.run(pipeline.run_channels([(ok, Policy(open=True)), (bad, Policy(open=True))], FakeSTT()))
+    assert ok.closed and bad.closed
+
+
+def test_run_channels_runs_services_and_closes_them():
+    class Service:
+        closed = False
+        started = False
+
+        async def serve_forever(self):
+            self.started = True
+            raise ConnectionError("listener died")
+
+        async def close(self):
+            self.closed = True
+
+    service, channel = Service(), FakeChannel([])
+    with pytest.raises(ExceptionGroup):
+        asyncio.run(pipeline.run_channels([(channel, Policy(open=True))], FakeSTT(), services=[service]))
+    assert service.started and service.closed and channel.closed

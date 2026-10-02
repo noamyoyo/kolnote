@@ -1,0 +1,48 @@
+# Two models behind one process: English always warm (for Home Assistant), Hebrew on demand
+# (for voice notes). Chat channels and the Wyoming server share them.
+#   kolnote run -c configs/multi-model.example.toml
+# Secrets come from the environment:
+#   KOLNOTE_CHANNELS__TELEGRAM__TOKEN, KOLNOTE_CHANNELS__WHATSAPP__API_KEY,
+#   KOLNOTE_CHANNELS__WHATSAPP__WEBHOOK_SECRET
+language = "he"                            # language of voice notes; Home Assistant sends its own
+
+[channels.telegram]
+[channels.telegram.policy]
+allow_senders = ["123456789"]
+max_duration_s = 600
+
+[channels.whatsapp]
+type = "openwa"
+base_url = "http://openwa:2785"
+session_id = "00000000-0000-0000-0000-000000000000"
+host = "0.0.0.0"
+port = 8765
+[channels.whatsapp.policy]
+allow_chats = ["120363000000000000@g.us"]
+max_duration_s = 600
+
+# Home Assistant: Settings > Devices > Add integration > Wyoming Protocol > host:10300.
+# No authentication, so bind to a trusted network only.
+[wyoming]
+host = "0.0.0.0"
+port = 10300
+
+[stt]
+type = "multi"
+default = "en"                             # used when the language matches no model
+exclusive = true                           # one model in memory at a time (small GPU shared with another model)
+
+[stt.models.en]
+type = "faster_whisper"
+model = "large-v3-turbo"
+compute_type = "int8_float16"              # "int8" on GPUs without tensor cores (pre-Volta)
+languages = ["en"]
+keep_warm = true                           # loaded at start, reloaded after the Hebrew model idles out
+# initial_prompt = "Names and words your assistant should spell right."
+
+[stt.models.he]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+compute_type = "int8_float16"
+languages = ["he"]
+idle_unload_s = 300                        # loaded on the first Hebrew note, dropped after 5 idle minutes

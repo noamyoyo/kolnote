@@ -1,0 +1,16 @@
+# One speech-to-text server for every channel: `kolnote serve -c configs/server.example.toml`
+# Channels then use [stt] type = "openai_compat" (see configs/multi.example.toml for the in-process alternative).
+language = "he"                           # default when a request does not send one
+
+[stt]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+device = "auto"
+compute_type = "int8_float16"             # use "int8" on GPUs without tensor cores (pre-Volta)
+
+[server]
+host = "127.0.0.1"                        # use 0.0.0.0 only inside a container or on a trusted network
+port = 8000
+preload = true                            # load the model at start, so the first note is not slow
+api_key_env = "STT_API_KEY"               # name of the env var holding the key; omit for no auth
+max_body_mb = 64

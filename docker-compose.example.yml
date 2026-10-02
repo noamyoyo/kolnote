@@ -1,0 +1,33 @@
+# One container: chat channels, a Wyoming server for Home Assistant, and the speech models.
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   cp configs/multi-model.example.toml kolnote.toml      # edit chat ids, drop what you do not use
+#   export TELEGRAM_TOKEN=...  OPENWA_API_KEY=...  OPENWA_WEBHOOK_SECRET=...
+#   docker compose up -d --build
+#
+# Secrets stay in the environment, the rest lives in kolnote.toml. A secret you do not need can
+# be removed together with its channel block. Models download into ./models on first use.
+#
+# The WhatsApp webhook port is published on loopback only; publish it on the network your OpenWA
+# gateway is on instead if the gateway runs elsewhere. The Wyoming port has no authentication:
+# publish it on a trusted network only.
+
+services:
+  kolnote:
+    build: { context: . }
+    restart: unless-stopped
+    command: ["run", "-c", "/config/kolnote.toml"]
+    ports:
+      - "127.0.0.1:8765:8765"   # OpenWA webhook
+      - "127.0.0.1:10300:10300" # Wyoming (Home Assistant); use "<lan-ip>:10300:10300" for HA on another host
+    environment:
+      KOLNOTE_CHANNELS__TELEGRAM__TOKEN: ${TELEGRAM_TOKEN:?set TELEGRAM_TOKEN}
+      KOLNOTE_CHANNELS__WHATSAPP__API_KEY: ${OPENWA_API_KEY:?set OPENWA_API_KEY}
+      KOLNOTE_CHANNELS__WHATSAPP__WEBHOOK_SECRET: ${OPENWA_WEBHOOK_SECRET:?set OPENWA_WEBHOOK_SECRET}
+    volumes:
+      - ./kolnote.toml:/config/kolnote.toml:ro
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]

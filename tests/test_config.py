@@ -1,3 +1,5 @@
+import pytest
+
 from kolnote.config import apply_env, load_settings
 
 
@@ -31,3 +33,32 @@ def test_json_values_and_no_mutation_of_other_sections():
     data = apply_env({"channel": {"type": "folder"}}, {"KOLNOTE_STT__EXTRA": '["a", "b"]'})
     assert data["stt"]["extra"] == ["a", "b"]
     assert data["channel"] == {"type": "folder"}
+
+
+def test_channels_tables_default_type_and_per_channel_policy(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        '[policy]\nallow_chats = ["global"]\n'
+        "[channels.telegram]\n[channels.telegram.policy]\nallow_senders = [\"42\"]\n"
+        '[channels.whatsapp]\ntype = "openwa"\nport = 8765\n'
+    )
+    s = load_settings(cfg, env={"KOLNOTE_CHANNELS__WHATSAPP__POLICY__ALLOW_CHATS": "a@g.us,b@g.us"})
+    specs = s.channel_specs()
+    assert specs == [
+        ({"type": "telegram"}, {"allow_senders": ["42"]}),
+        ({"type": "openwa", "port": 8765}, {"allow_chats": ["a@g.us", "b@g.us"]}),
+    ]
+
+
+def test_channel_without_policy_uses_global_policy_and_single_channel_still_works():
+    s = load_settings(env={"KOLNOTE_CHANNEL__TYPE": "telegram", "KOLNOTE_POLICY__ALLOW_SENDERS": "1"})
+    assert s.channel_specs() == [({"type": "telegram"}, {"allow_senders": ["1"]})]
+    t = load_settings(env={"KOLNOTE_CHANNELS__TELEGRAM__TOKEN": "t", "KOLNOTE_POLICY__ALLOW_SENDERS": "1"})
+    assert t.channel_specs() == [({"token": "t", "type": "telegram"}, {"allow_senders": ["1"]})]
+    assert load_settings(env={}).channel_specs() == []
+
+
+def test_channel_and_channels_together_is_an_error():
+    s = load_settings(env={"KOLNOTE_CHANNEL__TYPE": "folder", "KOLNOTE_CHANNELS__TELEGRAM__TOKEN": "t"})
+    with pytest.raises(ValueError, match="not both"):
+        s.channel_specs()
