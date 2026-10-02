@@ -279,6 +279,32 @@ choose it as the speech-to-text engine of a voice assistant.
   on demand for notes, exclusive on a small GPU) is the example in
   [`configs/multi-model.example.toml`](configs/multi-model.example.toml).
 
+### Connect Home Assistant, step by step
+
+1. **Run kolnote** with a `[wyoming]` section and `docker compose up -d` (the compose example
+   publishes port 10300 on loopback).
+2. **Add the integration.** Home Assistant: Settings, Devices & services, Add integration,
+   Wyoming Protocol. Host and port of kolnote, for example `127.0.0.1` and `10300`. Home Assistant
+   in Docker with `network_mode: host` reaches a loopback port; on another host publish the port
+   on the LAN address, or put both containers on one Docker network and use the service name.
+   The integration appears as `kolnote` and adds one speech-to-text entity, `stt.kolnote`.
+3. **Pick it in a voice assistant.** Settings, Voice assistants, open an assistant (or add one),
+   set **Speech-to-text** to `kolnote` and choose the **Language**. The language you choose is
+   the language kolnote receives, and a `multi` setup routes on it: English goes to the model
+   with `languages = ["en"]`, Hebrew to the one with `["he"]`. A language no model lists falls
+   back to `default`.
+4. **One assistant per language** is the simplest way to use both models: for example "Home" with
+   speech-to-text language English and a second one with Hebrew. Each assistant keeps its own
+   wake word, conversation agent and text-to-speech voice. Pick one when you start talking (the
+   assistant selector in the app, or the satellite device setting).
+5. **Test.** Settings, Voice assistants, the microphone icon on the assistant. kolnote logs a
+   line like `transcribed 3.0s of audio in 0.27s, 22 chars, language=en` per request, with no
+   transcript text.
+
+Speech-to-text is only the first stage. A Hebrew assistant also needs a conversation agent that
+understands Hebrew (an LLM works; the built-in intents have limited Hebrew) and a text-to-speech
+voice for Hebrew. The English assistant works with the built-in intents as is.
+
 ## Sharing the model with other programs
 
 `kolnote serve` exposes the `[stt]` engine over the OpenAI transcription API, so other programs
