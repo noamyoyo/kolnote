@@ -5,6 +5,8 @@
 #   KOLNOTE_CHANNELS__TELEGRAM__TOKEN, KOLNOTE_CHANNELS__WHATSAPP__API_KEY,
 #   KOLNOTE_CHANNELS__WHATSAPP__WEBHOOK_SECRET
 language = "he"                            # language of voice notes; Home Assistant sends its own
+# long_after_s = 120                       # recordings this long get the one-time "long recording" notice
+# long_text = "Long recording, transcribing now. This can take a minute."   # "" disables it
 
 [channels.telegram]
 [channels.telegram.policy]
@@ -19,7 +21,7 @@ host = "0.0.0.0"
 port = 8765
 [channels.whatsapp.policy]
 allow_chats = ["120363000000000000@g.us"]
-max_duration_s = 600
+max_duration_s = 3600
 
 # Home Assistant: Settings > Devices > Add integration > Wyoming Protocol > host:10300.
 # No authentication, so bind to a trusted network only.
@@ -46,3 +48,7 @@ model = "ivrit-ai/whisper-large-v3-turbo-ct2"
 compute_type = "int8_float16"
 languages = ["he"]
 idle_unload_s = 300                        # loaded on the first Hebrew note, dropped after 5 idle minutes
+paragraph_gap_s = 2                        # blank line wherever the speech pauses for 2 s or more
+# Label speakers (A:, B:) in recordings of 2 minutes or more, for example call recordings. Needs the
+# `diarize` extra and two models, see README "Long recordings and calls".
+# diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", num_speakers = 2, threads = 4, min_duration_s = 120 }

@@ -12,11 +12,31 @@ import gc
 import io
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Self
 
+from ...audio import decode_16k_mono, probe_duration_s
+from ...diarize import SherpaDiarizer, Word, build_dialogue, speaker_shares
 from ...models import Transcript
 
 log = logging.getLogger("kolnote.faster_whisper")
+
+
+def join_segments(segments, paragraph_gap_s: float = 0) -> str:
+    """Join segment texts with a space, or a blank line where the pause before a segment is at least
+    `paragraph_gap_s` (0 disables paragraphs)."""
+    parts: list[str] = []
+    previous_end = None
+    for s in segments:
+        text = s.text.strip()
+        if not text:
+            continue
+        if parts:
+            gap = s.start - previous_end if paragraph_gap_s and previous_end is not None else 0
+            parts.append("\n\n" if paragraph_gap_s and gap >= paragraph_gap_s else " ")
+        parts.append(text)
+        previous_end = s.end if paragraph_gap_s else None
+    return "".join(parts)
 
 
 class FasterWhisperSTT:
@@ -31,6 +51,9 @@ class FasterWhisperSTT:
         beam_size: int = 5,
         vad_filter: bool = True,
         initial_prompt: str | None = None,
+        condition_on_previous_text: bool | None = None,
+        paragraph_gap_s: float = 0,
+        diarize: dict[str, Any] | None = None,
         cpu_threads: int = 0,
         download_root: str | None = None,
         idle_unload_s: float = 0,
@@ -41,6 +64,22 @@ class FasterWhisperSTT:
         self._beam_size = beam_size
         self._vad_filter = vad_filter
         self._initial_prompt = initial_prompt
+        self._condition_on_previous_text = condition_on_previous_text
+        self._paragraph_gap_s = paragraph_gap_s
+        # `diarize` = {segmentation, embedding, num_speakers, threads, min_duration_s, max_duration_s,
+        # min_speaker_share}: label speakers (A, B) in recordings between min and max duration. A second
+        # speaker owning less than min_speaker_share of the words is treated as noise (a monologue
+        # that the fixed speaker count split in two). Needs the `diarize` extra.
+        self._diarizer: SherpaDiarizer | None = None
+        self._diarize_min_s = 120.0
+        self._diarize_max_s = 3600.0
+        self._min_speaker_share = 0.05
+        if diarize:
+            options = dict(diarize)
+            self._diarize_min_s = float(options.pop("min_duration_s", 120))
+            self._diarize_max_s = float(options.pop("max_duration_s", 3600))
+            self._min_speaker_share = float(options.pop("min_speaker_share", 0.05))
+            self._diarizer = SherpaDiarizer(**options)
         self._idle_unload_s = idle_unload_s
         self._model = None
         self._lock = asyncio.Lock()
@@ -55,16 +94,47 @@ class FasterWhisperSTT:
 
         return WhisperModel(self.model_id, **self._opts)
 
+    def _diarize(self, audio: bytes):
+        return self._diarizer.diarize(decode_16k_mono(audio))
+
     def _run(self, audio: bytes, language: str | None) -> tuple[str, str | None, float]:
-        segments, info = self._model.transcribe(
-            io.BytesIO(audio),
-            language=language,
-            beam_size=self._beam_size,
-            vad_filter=self._vad_filter,
-            initial_prompt=self._initial_prompt,
-        )
-        text = " ".join(s.text.strip() for s in segments).strip()
-        return text, info.language, info.duration
+        extra = {}
+        if self._condition_on_previous_text is not None:
+            extra["condition_on_previous_text"] = self._condition_on_previous_text
+        labelled = False
+        if self._diarizer is not None:
+            labelled = self._diarize_min_s <= (probe_duration_s(audio) or 0) <= self._diarize_max_s
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            # the CPU diarization runs while the GPU transcribes
+            turns_future = pool.submit(self._diarize, audio) if labelled else None
+            segments, info = self._model.transcribe(
+                io.BytesIO(audio),
+                language=language,
+                beam_size=self._beam_size,
+                vad_filter=self._vad_filter,
+                initial_prompt=self._initial_prompt,
+                word_timestamps=labelled,
+                **extra,
+            )
+            segments = list(segments)
+            turns = None
+            if turns_future is not None:
+                try:
+                    turns = turns_future.result()
+                except Exception:
+                    log.exception("diarization failed, returning the transcript without speaker labels")
+        except BaseException:
+            # do not hold the engine lock (and the error reply) until the CPU diarization is done
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown()
+        if turns:
+            words = [Word(w.start, w.end, w.word) for s in segments for w in (s.words or [])]
+            shares = speaker_shares(words, turns)
+            if len(shares) > 1 and min(shares.values()) >= self._min_speaker_share:
+                return build_dialogue(words, turns, paragraph_gap_s=self._paragraph_gap_s), info.language, info.duration
+        return join_segments(segments, self._paragraph_gap_s), info.language, info.duration
 
     def _arm_unload(self) -> None:
         if not self._idle_unload_s:

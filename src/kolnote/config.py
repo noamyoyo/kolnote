@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .pipeline import LOADING, UNSUPPORTED
+from .pipeline import LONG, LONG_AFTER_S, LOADING, UNSUPPORTED
 
 ENV_PREFIX = "KOLNOTE_"
 LIST_KEYS = {"allow_chats", "allow_senders", "languages"}
@@ -26,6 +26,8 @@ class Settings:
     concurrency: int = 1
     unsupported_text: str = UNSUPPORTED
     loading_text: str = LOADING
+    long_text: str = LONG
+    long_after_s: float = LONG_AFTER_S
 
     def channel_specs(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         """(channel spec, policy options) for each configured channel.
@@ -90,4 +92,6 @@ def load_settings(path: Path | None = None, env: Mapping[str, str] | None = None
         concurrency=int(data.get("concurrency", 1)),
         unsupported_text=str(data.get("unsupported_text", UNSUPPORTED)),
         loading_text=str(data.get("loading_text", LOADING)),
+        long_text=str(data.get("long_text", LONG)),
+        long_after_s=float(data.get("long_after_s", LONG_AFTER_S)),
     )

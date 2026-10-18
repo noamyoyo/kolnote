@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import Sequence
 
+from .audio import probe_duration_s as _probe_duration_s
 from .models import Incoming, UnsupportedMessage
 from .policy import Policy
 from .ports import Channel, Service, STTEngine
@@ -14,6 +15,8 @@ log = logging.getLogger("kolnote")
 NO_SPEECH = "(no speech detected)"
 UNSUPPORTED = "I can only transcribe voice notes. Please send a voice message."
 LOADING = "Loading the speech model, this note will take a few seconds longer."
+LONG = "Long recording, transcribing now. This can take a minute."
+LONG_AFTER_S = 120.0
 
 
 async def handle(
@@ -26,6 +29,8 @@ async def handle(
     error_text: str | None,
     unsupported_text: str | None = UNSUPPORTED,
     loading_text: str | None = None,
+    long_text: str | None = None,
+    long_after_s: float = LONG_AFTER_S,
 ) -> None:
     reason = policy.check(msg)
     if reason:
@@ -40,12 +45,19 @@ async def handle(
         "received %s/%s from %s audio=%.1fs %d bytes",
         msg.channel, msg.message_id, msg.sender_id, msg.duration_s or 0, len(msg.audio),
     )
+    notice = None
+    if long_text:
+        duration = msg.duration_s or await asyncio.to_thread(_probe_duration_s, msg.audio)
+        if duration and duration >= long_after_s:
+            notice = long_text
     needs_load = getattr(engine, "needs_load", None)
-    if loading_text and needs_load and needs_load(language):
+    if notice is None and loading_text and needs_load and needs_load(language):
+        notice = loading_text
+    if notice:
         try:
-            await channel.reply(msg, loading_text)
+            await channel.reply(msg, notice)
         except Exception:
-            log.exception("could not send the loading notice for %s/%s", msg.channel, msg.message_id)
+            log.exception("could not send the notice for %s/%s", msg.channel, msg.message_id)
     try:
         transcript = await engine.transcribe(msg.audio, mime_type=msg.mime_type, language=language)
     except Exception:
@@ -71,6 +83,8 @@ async def run_channels(
     error_text: str | None = "Transcription failed.",
     unsupported_text: str | None = UNSUPPORTED,
     loading_text: str | None = None,
+    long_text: str | None = None,
+    long_after_s: float = LONG_AFTER_S,
 ) -> None:
     """Serve every channel and service with one shared engine. One of them failing stops them all."""
     semaphore = asyncio.Semaphore(concurrency)
@@ -87,6 +101,8 @@ async def run_channels(
                     error_text=error_text,
                     unsupported_text=unsupported_text,
                     loading_text=loading_text,
+                    long_text=long_text,
+                    long_after_s=long_after_s,
                 )
             except Exception:
                 log.exception("unhandled error for %s/%s", msg.channel, msg.message_id)
@@ -119,6 +135,8 @@ async def run(
     error_text: str | None = "Transcription failed.",
     unsupported_text: str | None = UNSUPPORTED,
     loading_text: str | None = None,
+    long_text: str | None = None,
+    long_after_s: float = LONG_AFTER_S,
 ) -> None:
     await run_channels(
         [(channel, policy)],
@@ -128,4 +146,6 @@ async def run(
         error_text=error_text,
         unsupported_text=unsupported_text,
         loading_text=loading_text,
+        long_text=long_text,
+        long_after_s=long_after_s,
     )

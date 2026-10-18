@@ -13,21 +13,92 @@ import base64
 import hmac
 import json
 import logging
+import mimetypes
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from hashlib import sha256
+from pathlib import PurePath
 from typing import Any, Self
 from urllib.parse import quote
 
-from ...models import Incoming, IncomingAudio, UnsupportedMessage
+from ...models import AUDIO_EXTENSIONS, Incoming, IncomingAudio, UnsupportedMessage
 
 log = logging.getLogger(__name__)
 
 VOICE_TYPES = {"voice", "audio", "ptt"}
 USER_CONTENT_TYPES = {"text", "chat", "image", "video", "document", "sticker", "location", "contact", "poll"}
 MAX_BODY_BYTES = 32 * 1024 * 1024
+MAX_TEXT = 4000  # OpenWA rejects send-text above 4096 characters
 SEEN_LIMIT = 1024
+
+
+MEDIA_KEYS = ("mimetype", "filename", "data", "omitted", "duration")
+# .mp4 and .webm are usually video: only trust them when the mimetype says audio
+# Generic or non-audio types that phones attach to audio files; the extension then decides.
+UNTYPED_MIMES = ("", "application/octet-stream", "application/ogg", "application/x-ogg")
+DOCUMENT_AUDIO_EXTENSIONS = AUDIO_EXTENSIONS - {".mp4", ".webm"}
+EXTENSION_MIMES = {".m4a": "audio/mp4"}
+
+
+def _media_info(data: dict[str, Any]) -> dict[str, Any]:
+    """Media fields merged from every place OpenWA may put them; later sources win."""
+    metadata = data.get("metadata")
+    sources = [data, metadata, metadata.get("media") if isinstance(metadata, dict) else None, data.get("media")]
+    info: dict[str, Any] = {}
+    for source in sources:
+        if isinstance(source, dict):
+            info.update({k: source[k] for k in MEDIA_KEYS if source.get(k) not in (None, "")})
+    return info
+
+
+def _duration(value: Any) -> float | None:
+    """Seconds as a float. Gateways send numbers or numeric strings; anything else is unknown."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if 0 < seconds < float("inf") else None
+
+
+def _split_text(text: str, limit: int = MAX_TEXT) -> list[str]:
+    """Split at a line break or space near the limit, so a long transcript is not cut mid-word."""
+    parts: list[str] = []
+    while len(text) > limit:
+        cut = max(text.rfind("\n", 0, limit), text.rfind(" ", 0, limit))
+        if cut < limit // 2:
+            cut = limit
+        parts.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return [p for p in (*parts, text) if p.strip()] or [text]
+
+
+def _clean_mime(mime: Any) -> str:
+    return str(mime or "").split(";")[0].strip().lower()
+
+
+def _resolve_mime(mime: Any, filename: Any) -> str:
+    """Keep a real audio/video type; otherwise derive it from the filename, else assume ogg (voice notes)."""
+    mime = _clean_mime(mime)
+    if mime.startswith(("audio/", "video/")):
+        return mime
+    suffix = PurePath(str(filename or "")).suffix.lower()
+    return mimetypes.guess_type(f"x{suffix}")[0] or EXTENSION_MIMES.get(suffix) or "audio/ogg"
+
+
+def _is_audio(data: dict[str, Any]) -> bool:
+    """Voice notes, plus audio files attached as documents (gallery or file picker, e.g. call recordings)."""
+    kind = data.get("type")
+    if kind in VOICE_TYPES:
+        return True
+    if kind != "document":
+        return False
+    media = _media_info(data)
+    mime = _clean_mime(media.get("mimetype"))
+    if mime.startswith("audio/"):
+        return True
+    suffix = PurePath(str(media.get("filename") or "")).suffix.lower()
+    return mime in UNTYPED_MIMES and suffix in DOCUMENT_AUDIO_EXTENSIONS
 
 
 class OpenWAChannel:
@@ -88,6 +159,8 @@ class OpenWAChannel:
                 status = 404
             elif not 0 < length <= MAX_BODY_BYTES:
                 status = 413 if length > MAX_BODY_BYTES else 400
+                if status == 413:
+                    log.warning("webhook body too large: %d bytes (limit %d), message dropped", length, MAX_BODY_BYTES)
             else:
                 body = await asyncio.wait_for(reader.readexactly(length), 30)
                 if not hmac.compare_digest(self._sign(body), headers.get("x-openwa-signature", "")):
@@ -124,14 +197,14 @@ class OpenWAChannel:
         return 200
 
     async def _audio_bytes(self, data: dict[str, Any]) -> tuple[bytes, str]:
-        media = data.get("media") or {}
-        mime = (media.get("mimetype") or "audio/ogg").split(";")[0]
+        media = _media_info(data)
+        mime = _resolve_mime(media.get("mimetype"), media.get("filename"))
         if isinstance(media.get("data"), str) and not media.get("omitted"):
             return base64.b64decode(media["data"]), mime
         url = f"{self._base}/messages/{quote(data['chatId'], safe='')}/{quote(data['id'], safe='')}/media"
         resp = await self._client.get(url)
         resp.raise_for_status()
-        return resp.content, resp.headers.get("content-type", mime).split(";")[0]
+        return resp.content, _resolve_mime(resp.headers.get("content-type") or mime, media.get("filename"))
 
     async def messages(self) -> AsyncIterator[Incoming]:
         self._server = await asyncio.start_server(self._handle_http, self._host, self._port)
@@ -139,7 +212,7 @@ class OpenWAChannel:
         while True:
             data, received_at = await self._queue.get()
             sender = data.get("senderPhone") or data.get("author") or data.get("from") or ""
-            if data.get("type") not in VOICE_TYPES:
+            if not _is_audio(data):
                 yield UnsupportedMessage(
                     channel=self.name,
                     chat_id=data["chatId"],
@@ -164,7 +237,7 @@ class OpenWAChannel:
                 sender_id=str(sender),
                 audio=audio,
                 mime_type=mime,
-                duration_s=(data.get("media") or {}).get("duration"),
+                duration_s=_duration(_media_info(data).get("duration")),
                 received_at=received_at,
                 meta={"author": data.get("author"), "from": data.get("from"), "type": data.get("type")},
             )
@@ -179,11 +252,12 @@ class OpenWAChannel:
             log.warning("read receipt failed for %s: %s", data.get("id"), exc)
 
     async def reply(self, to: Incoming, text: str) -> None:
-        resp = await self._client.post(
-            f"{self._base}/messages/send-text",
-            json={"chatId": to.chat_id, "text": text},
-        )
-        resp.raise_for_status()
+        for part in _split_text(text):
+            resp = await self._client.post(
+                f"{self._base}/messages/send-text",
+                json={"chatId": to.chat_id, "text": part},
+            )
+            resp.raise_for_status()
 
     async def close(self) -> None:
         if self._server:
