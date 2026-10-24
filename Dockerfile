@@ -29,7 +29,7 @@ CMD ["serve"]
 FROM base AS full
 ENV HF_HOME=/models \
     LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
-RUN pip install --no-cache-dir ".[faster-whisper,http,wyoming]" nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+RUN pip install --no-cache-dir ".[faster-whisper,http,wyoming,diarize]" nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
 COPY README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir --no-deps .

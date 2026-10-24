@@ -34,6 +34,8 @@ async def _run(config: Path | None) -> None:
         concurrency=settings.concurrency,
         unsupported_text=settings.unsupported_text or None,
         loading_text=settings.loading_text or None,
+        long_text=settings.long_text or None,
+        long_after_s=settings.long_after_s,
     )
 
 

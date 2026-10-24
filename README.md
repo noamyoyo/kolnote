@@ -26,6 +26,7 @@ Proof of concept, used daily on one setup. Working today:
 - Several models in one process (`type = "multi"`), chosen by language, with always-warm and on-demand models, see [Several models, one GPU](#several-models-one-gpu).
 - A Wyoming speech-to-text server, so Home Assistant can use the same process, see [Home Assistant (Wyoming)](#home-assistant-wyoming).
 - `kolnote serve`: expose the model to other programs over the OpenAI transcription API, see [Sharing the model with other programs](#sharing-the-model-with-other-programs).
+- Long recordings: a "this will take a minute" notice, paragraph breaks at pauses, and optional A/B speaker labels for calls, see [Long recordings and calls](#long-recordings-and-calls).
 - Deny-by-default allowlist, benchmark tool (WER/CER/speed), Docker image.
 
 Not done yet: measuring audio length when the gateway does not report it. How it is built is in
@@ -78,7 +79,17 @@ kolnote run -c configs/openwa.toml
 Behavior in an allowed chat:
 
 - A voice note gets a read receipt, then the transcript as a text reply.
-- Any other message (text, image, sticker, a file sent as a document, ...) gets a short "I can
+- An audio file sent as a document (an `.m4a` call recording, an `.mp3`, ...) is transcribed too.
+  The gateway delivers it as `type=document`; kolnote accepts it when the mime type is `audio/*`,
+  or when the mime type is missing and the file extension is an audio one.
+- A long transcript is split into several replies. OpenWA refuses `send-text` bodies over 4096
+  characters, so kolnote cuts at a blank line (a paragraph or speaker block), else a line or word
+  break, near 4000 characters and sends the parts in order. Each part starts with a line such as
+  `Part 1 of 2`, so the messages read as one transcript. Change the wording with the channel option
+  `part_text` (`{n}` and `{total}` are filled in; for Hebrew `"חלק {n} מתוך {total}"`), or set it to `""`.
+- A recording of two minutes or more first gets one notice (`long_text`), see
+  [Long recordings and calls](#long-recordings-and-calls).
+- Any other message (text, image, sticker, a non-audio file, ...) gets a short "I can
   only transcribe voice notes" reply. Change the wording with `unsupported_text`, or set it to
   `""` to stay silent.
 - The bot's own messages and non-message events are ignored, so it cannot reply to itself.
@@ -92,8 +103,14 @@ Caveats:
   `ConnectError: Name or service not known` when the bot tries to reply.
 - **Unofficial connection.** Baileys-based gateways use an unofficial WhatsApp Web connection.
   Use a dedicated number; WhatsApp's terms do not endorse this.
-- **No duration limit.** The gateway does not report audio length, so `max_duration_s` is not
-  enforced on WhatsApp. Log lines show `audio=0.0s` for this reason.
+- **Duration.** The gateway often does not report audio length. kolnote then reads it from the
+  file for the long notice only. `max_duration_s` is enforced only when the gateway reports a
+  duration (audio documents often carry one), and a message over the limit is ignored without a
+  reply. Set it above your longest call (`3600` in the examples for call recordings). Log lines can
+  show `audio=0.0s`.
+- **Large files.** The webhook carries the file inline, and kolnote rejects bodies over its size
+  limit (log: `webhook body too large`). Media the gateway has already shed (`omitted`) is
+  downloaded from the gateway instead.
 - **Plain replies.** The reply is sent as plain text, not as a quoted reply, because a
   chat-restricted OpenWA key is not allowed to quote.
 - **Webhook port.** Publish port 8765 only to a network the gateway can reach, never the open
@@ -247,6 +264,101 @@ How it behaves:
 With `multi`, set `idle_unload_s` per model. Under `[stt]` itself only `default`, `exclusive` and
 `models` are accepted; anything else stops the process with an error.
 
+## Long recordings and calls
+
+Three optional features for recordings longer than a voice note, such as a phone call sent as an
+`.m4a` file. They are independent; each is off unless configured (the notice is on by default).
+
+**Notice.** When the audio is at least `long_after_s` seconds (default 120), kolnote replies once
+with `long_text` ("Long recording, transcribing now. This can take a minute.") before it starts.
+The duration comes from the gateway when it reports one, otherwise kolnote reads it from the file.
+The long notice replaces the cold-start `loading_text` notice, so a recording never gets two.
+Set `long_text = ""` to disable it.
+
+**Paragraphs.** `paragraph_gap_s = 2` (a `faster_whisper` option) starts a new paragraph, with a
+blank line, wherever the speech pauses for at least that many seconds. Default `0`: one block of text.
+
+**Speaker labels.** With the `diarize` option, a recording of at least `min_duration_s` seconds
+is split by speaker and printed as blocks:
+
+```
+Person A: Hello, this is the bank calling about your loan.
+
+Person B: Yes, go ahead.
+```
+
+Speakers are named in order of first appearance (`speaker_labels`, default the letters `A`, `B`). A long monologue still breaks at pauses, keeping its label.
+Shorter recordings, longer ones than `max_duration_s`, and recordings that are not a conversation
+come back as plain text. kolnote decides that from the audio, not from the file type: the number of
+speakers is found by clustering (`threshold`), and a speaker who owns less than `min_speaker_share`
+of the words (default 5%) counts as noise. Fewer than two real speakers left means plain text, so a
+long voice note by one person, a lecture or a recording with background voices is not labelled.
+If diarization or the merge fails, kolnote logs the error and sends the plain transcript.
+
+**How a word gets its speaker.** A call recorded in mono is hard to split: the quieter person mostly
+answers while the other one is still talking, and word times and speaker turns each drift by a fraction of
+a second. So a speaker counts as speaking a word when its turns cover at least half of the word
+(`merge.min_cover`), and when a long turn blankets a short reply inside it, the shortest covering turn wins.
+A word never moves to another speaker between a number and the word after it
+(`merge.num_gap_s`), unless the number ends a sentence. A reply of up to three words (`merge.inline_max_words`)
+that interrupts an unfinished sentence is shown inline instead of as a block of its own:
+
+```
+Person A: I paid the whole amount (Person B: yes) last month and then they called again.
+```
+
+The merge never drops, repeats or reorders a word; a test checks that on random input. It reduces the
+chopped-up look of a call, it does not make the split exact.
+
+```toml
+[stt.models.he]
+type = "faster_whisper"
+model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+languages = ["he"]
+paragraph_gap_s = 2
+diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", threshold = 0.8, threads = 4, min_duration_s = 120, speaker_labels = ["Person A", "Person B"] }
+```
+
+| Key | Where | Meaning |
+|-----|-------|---------|
+| `long_after_s` | top level | Seconds of audio that trigger the long notice. Default `120`. |
+| `long_text` | top level | The notice. Empty string disables it. |
+| `paragraph_gap_s` | `faster_whisper` | Pause, in seconds, that starts a new paragraph. `0` disables it. |
+| `condition_on_previous_text` | `faster_whisper` | Passed to Whisper. Leave unset for the default. |
+| `diarize.segmentation` | `faster_whisper` | Folder holding `model.onnx` (pyannote segmentation 3.0), or the file itself. |
+| `diarize.embedding` | `faster_whisper` | Speaker embedding model (`.onnx`). |
+| `diarize.threshold` | `faster_whisper` | Clustering threshold when the speaker count is automatic. Default `0.8`. Measured on one two-person call and one single-voice control: `0.8` to `0.9` found 2 and 1 speakers; `0.7` and below invented speakers; `1.0` merged everyone. Tune it on your own recordings. |
+| `diarize.num_speakers` | `faster_whisper` | Force this many speakers instead of detecting them. Default `0` (detect). |
+| `diarize.threads` | `faster_whisper` | CPU threads for diarization. |
+| `diarize.min_duration_s` | `faster_whisper` | Shortest recording that is diarized. Default `120`. |
+| `diarize.max_duration_s` | `faster_whisper` | Longest recording that is diarized, to bound memory and CPU time. Default `3600`. |
+| `diarize.speaker_labels` | `faster_whisper` | Names for the speakers, in order of first appearance, instead of `A`, `B`. Names must be non-empty and distinct. Use words in the transcript's language: a Latin letter in front of Hebrew text mixes the two directions. For Hebrew: `["אדם א'", "אדם ב'"]`. More speakers than names fall back to letters. |
+| `diarize.merge` | `faster_whisper` | Table of merge tuning knobs, all optional: `min_cover` (share of a word a speaker's turns must cover, default `0.5`), `num_gap_s` (no speaker change this close after a number, default `0.3`), `inline_max_words` (longest reply shown inline, `0` turns inline replies off, default `3`). Further cleanup steps exist (`bc_max_s`, `min_run_words`, `snap_words`, see `src/kolnote/dialogue.py`) but are off by default: on a real call they deleted most of the quieter speaker's replies. Values must be non-negative numbers; a wrong value stops kolnote at start. |
+| `diarize.min_speaker_share` | `faster_whisper` | Smallest share of the words a speaker must own to count; smaller ones are dropped as noise. Default `0.05`. |
+
+Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): CPU only, no PyTorch and no
+account tokens. Install the extra (`pip install -e '.[faster-whisper,diarize]'`; the Docker `full`
+target already includes it) and download the two models once:
+
+```bash
+mkdir -p models/diarization && cd models/diarization
+curl -L https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar xjf -
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+```
+
+Things to know:
+
+- The labels are generic (`A`, `B`, or your `speaker_labels`), not names, and kolnote does not know which person is which.
+- A reply over about 4000 characters is split at a blank line when it can, so a speaker block keeps its
+  label. Only a single block over about 2000 characters is cut inside the block.
+- Diarization runs on the CPU while the GPU transcribes, so the two overlap. A 10-minute call took
+  about 2 minutes in total. The router serializes requests, so a call blocks the next note meanwhile.
+- Where two people talk at once, a word can land on the wrong speaker, and the speech recogniser
+  sometimes repeats a word there. A change of speaker can sit about one word off. Treat the split as a
+  reading aid, not a record.
+- The embedding model is trained mostly on English speech. Check the split on your own language
+  before relying on it.
+
 ## Home Assistant (Wyoming)
 
 Home Assistant's voice pipeline talks to speech-to-text servers over the
@@ -395,6 +507,7 @@ Secrets belong in environment variables. See `config.example.toml` and `configs/
 | `concurrency` | Notes transcribed in parallel (default 1; the model runs one at a time anyway). |
 | `unsupported_text` | Reply for non-voice messages. Empty string disables it. |
 | `loading_text` | Reply sent before the transcript when the note has to wait for a model to load (cold start). Empty string disables it. |
+| `long_text`, `long_after_s` | Notice sent for recordings of at least `long_after_s` seconds (default 120), see [Long recordings and calls](#long-recordings-and-calls). Empty `long_text` disables it. |
 | `[channel]` / `[stt]` | `type` plus that adapter's options. |
 | `[channels.<name>]` | Several channels at once, each with its own optional `policy`. Replaces `[channel]`. |
 | `[wyoming]` | Also listen as a Wyoming speech-to-text server, see [Home Assistant (Wyoming)](#home-assistant-wyoming). Keys: `host`, `port`, `languages`. |
