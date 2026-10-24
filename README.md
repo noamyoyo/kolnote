@@ -83,7 +83,10 @@ Behavior in an allowed chat:
   The gateway delivers it as `type=document`; kolnote accepts it when the mime type is `audio/*`,
   or when the mime type is missing and the file extension is an audio one.
 - A long transcript is split into several replies. OpenWA refuses `send-text` bodies over 4096
-  characters, so kolnote cuts at a line or word break near 4000 characters and sends the parts in order.
+  characters, so kolnote cuts at a blank line (a paragraph or speaker block), else a line or word
+  break, near 4000 characters and sends the parts in order. Each part starts with a line such as
+  `Part 1 of 2`, so the messages read as one transcript. Change the wording with the channel option
+  `part_text` (`{n}` and `{total}` are filled in; for Hebrew `"חלק {n} מתוך {total}"`), or set it to `""`.
 - A recording of two minutes or more first gets one notice (`long_text`), see
   [Long recordings and calls](#long-recordings-and-calls).
 - Any other message (text, image, sticker, a non-audio file, ...) gets a short "I can
@@ -279,17 +282,33 @@ blank line, wherever the speech pauses for at least that many seconds. Default `
 is split by speaker and printed as blocks:
 
 ```
-A: Hello, this is the bank calling about your loan.
+Person A: Hello, this is the bank calling about your loan.
 
-B: Yes, go ahead.
+Person B: Yes, go ahead.
 ```
 
-Letters follow first appearance. A long monologue still breaks at pauses, keeping its letter.
-Shorter recordings, longer ones than `max_duration_s`, and recordings where only one speaker owns
-words come back as plain text. The diarizer always finds exactly `num_speakers`, so a long voice
-note by one person would be split in two; to avoid that, a second speaker who owns less than
-`min_speaker_share` of the words (default 5%) counts as noise and the text stays plain.
-If diarization fails, kolnote logs the error and sends the plain transcript.
+Speakers are named in order of first appearance (`speaker_labels`, default the letters `A`, `B`). A long monologue still breaks at pauses, keeping its label.
+Shorter recordings, longer ones than `max_duration_s`, and recordings that are not a conversation
+come back as plain text. kolnote decides that from the audio, not from the file type: the number of
+speakers is found by clustering (`threshold`), and a speaker who owns less than `min_speaker_share`
+of the words (default 5%) counts as noise. Fewer than two real speakers left means plain text, so a
+long voice note by one person, a lecture or a recording with background voices is not labelled.
+If diarization or the merge fails, kolnote logs the error and sends the plain transcript.
+
+**How a word gets its speaker.** A call recorded in mono is hard to split: the quieter person mostly
+answers while the other one is still talking, and word times and speaker turns each drift by a fraction of
+a second. So a speaker counts as speaking a word when its turns cover at least half of the word
+(`merge.min_cover`), and when a long turn blankets a short reply inside it, the shortest covering turn wins.
+A word never moves to another speaker between a number and the word after it
+(`merge.num_gap_s`), unless the number ends a sentence. A reply of up to three words (`merge.inline_max_words`)
+that interrupts an unfinished sentence is shown inline instead of as a block of its own:
+
+```
+Person A: I paid the whole amount (Person B: yes) last month and then they called again.
+```
+
+The merge never drops, repeats or reorders a word; a test checks that on random input. It reduces the
+chopped-up look of a call, it does not make the split exact.
 
 ```toml
 [stt.models.he]
@@ -297,7 +316,7 @@ type = "faster_whisper"
 model = "ivrit-ai/whisper-large-v3-turbo-ct2"
 languages = ["he"]
 paragraph_gap_s = 2
-diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", num_speakers = 2, threads = 4, min_duration_s = 120 }
+diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", threshold = 0.8, threads = 4, min_duration_s = 120, speaker_labels = ["Person A", "Person B"] }
 ```
 
 | Key | Where | Meaning |
@@ -308,11 +327,14 @@ diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentatio
 | `condition_on_previous_text` | `faster_whisper` | Passed to Whisper. Leave unset for the default. |
 | `diarize.segmentation` | `faster_whisper` | Folder holding `model.onnx` (pyannote segmentation 3.0), or the file itself. |
 | `diarize.embedding` | `faster_whisper` | Speaker embedding model (`.onnx`). |
-| `diarize.num_speakers` | `faster_whisper` | Speakers to find. Default `2`. |
+| `diarize.threshold` | `faster_whisper` | Clustering threshold when the speaker count is automatic. Default `0.8`. Measured on one two-person call and one single-voice control: `0.8` to `0.9` found 2 and 1 speakers; `0.7` and below invented speakers; `1.0` merged everyone. Tune it on your own recordings. |
+| `diarize.num_speakers` | `faster_whisper` | Force this many speakers instead of detecting them. Default `0` (detect). |
 | `diarize.threads` | `faster_whisper` | CPU threads for diarization. |
 | `diarize.min_duration_s` | `faster_whisper` | Shortest recording that is diarized. Default `120`. |
 | `diarize.max_duration_s` | `faster_whisper` | Longest recording that is diarized, to bound memory and CPU time. Default `3600`. |
-| `diarize.min_speaker_share` | `faster_whisper` | Smallest share of the words the second speaker must own. Default `0.05`. |
+| `diarize.speaker_labels` | `faster_whisper` | Names for the speakers, in order of first appearance, instead of `A`, `B`. Names must be non-empty and distinct. Use words in the transcript's language: a Latin letter in front of Hebrew text mixes the two directions. For Hebrew: `["אדם א'", "אדם ב'"]`. More speakers than names fall back to letters. |
+| `diarize.merge` | `faster_whisper` | Table of merge tuning knobs, all optional: `min_cover` (share of a word a speaker's turns must cover, default `0.5`), `num_gap_s` (no speaker change this close after a number, default `0.3`), `inline_max_words` (longest reply shown inline, `0` turns inline replies off, default `3`). Further cleanup steps exist (`bc_max_s`, `min_run_words`, `snap_words`, see `src/kolnote/dialogue.py`) but are off by default: on a real call they deleted most of the quieter speaker's replies. Values must be non-negative numbers; a wrong value stops kolnote at start. |
+| `diarize.min_speaker_share` | `faster_whisper` | Smallest share of the words a speaker must own to count; smaller ones are dropped as noise. Default `0.05`. |
 
 Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): CPU only, no PyTorch and no
 account tokens. Install the extra (`pip install -e '.[faster-whisper,diarize]'`; the Docker `full`
@@ -326,13 +348,14 @@ curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongi
 
 Things to know:
 
-- The labels are `A` and `B`, not names, and kolnote does not know which person is which.
-- A reply over about 4000 characters is split at a line break, so a long speaker block can continue in
-  the next message without its label.
+- The labels are generic (`A`, `B`, or your `speaker_labels`), not names, and kolnote does not know which person is which.
+- A reply over about 4000 characters is split at a blank line when it can, so a speaker block keeps its
+  label. Only a single block over about 2000 characters is cut inside the block.
 - Diarization runs on the CPU while the GPU transcribes, so the two overlap. A 10-minute call took
   about 2 minutes in total. The router serializes requests, so a call blocks the next note meanwhile.
-- Where two people talk at once, a word can land on the wrong speaker, and a number can be split
-  across a short overlap. Treat the split as a reading aid, not a record.
+- Where two people talk at once, a word can land on the wrong speaker, and the speech recogniser
+  sometimes repeats a word there. A change of speaker can sit about one word off. Treat the split as a
+  reading aid, not a record.
 - The embedding model is trained mostly on English speech. Check the split on your own language
   before relying on it.
 

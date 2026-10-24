@@ -342,6 +342,7 @@ def test_reply_sends_long_text_in_order_in_several_messages():
         return httpx.Response(201, json={})
 
     ch = make_channel(handler)
+    ch._part_text = ""  # the part header is tested separately
     text = " ".join(f"w{i}" for i in range(3000))
 
     async def scenario(task):
@@ -380,3 +381,65 @@ def test_audio_document_with_string_duration_gives_a_number():
         assert (await asyncio.wait_for(task, 5)).duration_s == 630.0
 
     run_with_server(ch, scenario)
+
+
+def test_split_text_prefers_block_boundaries_so_labels_stay_with_their_text():
+    from kolnote.adapters.channels.openwa import _split_text
+
+    a = "A: " + "x " * 1000   # about 2000 characters
+    b = "B: " + "y " * 1000
+    c = "A: " + "z " * 1000
+    parts = _split_text("\n\n".join([a.strip(), b.strip(), c.strip()]), limit=4100)
+    assert len(parts) == 2
+    assert [p[:2] for p in parts] == ["A:", "A:"]
+    assert parts[0].count("B:") == 1 and parts[0].endswith("y")
+
+
+def _sent_texts(part_text=None):
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(201, json={})
+
+    ch = make_channel(handler)
+    if part_text is not None:
+        ch._part_text = part_text
+    return ch, sent
+
+
+class _To:
+    chat_id = "1@g.us"
+
+
+BIG = "\n\n".join(["A: " + "word " * 300] * 4)
+
+
+def test_split_reply_parts_say_which_part_they_are():
+    ch, sent = _sent_texts()
+    asyncio.run(ch.reply(_To(), BIG))
+    assert len(sent) == 2
+    assert sent[0].startswith("Part 1 of 2\n\n") and sent[1].startswith("Part 2 of 2\n\n")
+    assert all(len(p) <= 4096 for p in sent)
+    sent.clear()
+    asyncio.run(ch.reply(_To(), "short"))
+    assert sent == ["short"]
+
+
+def test_part_text_can_be_localised_or_disabled():
+    for part_text, first in (("חלק {n} מתוך {total}", "חלק 1 מתוך 2\n\n"), ("", "A: ")):
+        ch, sent = _sent_texts(part_text)
+        asyncio.run(ch.reply(_To(), BIG))
+        assert sent[0].startswith(first)
+
+
+def test_invalid_part_text_fails_at_start():
+    for bad in ("Part {n}/{total} {x}", "50% {", "{0}"):
+        with pytest.raises(ValueError, match="part_text"):
+            OpenWAChannel("http://openwa", "sid", "key", SECRET, port=free_port(), part_text=bad)
+
+
+def test_part_text_that_could_overflow_a_part_fails_at_start():
+    for bad in ("x" * 100, "{n.x}"):
+        with pytest.raises(ValueError, match="part_text"):
+            OpenWAChannel("http://openwa", "sid", "key", SECRET, port=free_port(), part_text=bad)

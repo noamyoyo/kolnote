@@ -14,6 +14,7 @@ allow_senders = ["123456789"]
 max_duration_s = 600
 
 [channels.whatsapp]
+# part_text = "Part {n} of {total}"   # first line of each message when a long transcript is split; "" disables it
 type = "openwa"
 base_url = "http://openwa:2785"
 session_id = "00000000-0000-0000-0000-000000000000"
@@ -50,5 +51,6 @@ languages = ["he"]
 idle_unload_s = 300                        # loaded on the first Hebrew note, dropped after 5 idle minutes
 paragraph_gap_s = 2                        # blank line wherever the speech pauses for 2 s or more
 # Label speakers (A:, B:) in recordings of 2 minutes or more, for example call recordings. Needs the
-# `diarize` extra and two models, see README "Long recordings and calls".
-# diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", num_speakers = 2, threads = 4, min_duration_s = 120 }
+# `diarize` extra and two models, see README "Long recordings and calls". Optional tuning: add
+# `merge = { min_cover = 0.5, num_gap_s = 0.3, inline_max_words = 3 }` to the table.
+# diarize = { segmentation = "/models/diarization/sherpa-onnx-pyannote-segmentation-3-0", embedding = "/models/diarization/wespeaker_en_voxceleb_resnet34_LM.onnx", threshold = 0.8, threads = 4, min_duration_s = 120, speaker_labels = ["Person A", "Person B"] }

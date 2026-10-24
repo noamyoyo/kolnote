@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Self
 
 from ...audio import decode_16k_mono, probe_duration_s
-from ...diarize import SherpaDiarizer, Word, build_dialogue, speaker_shares
+from ...dialogue import MergeOptions, build_dialogue
+from ...diarize import SherpaDiarizer, Word
 from ...models import Transcript
 
 log = logging.getLogger("kolnote.faster_whisper")
@@ -37,6 +38,16 @@ def join_segments(segments, paragraph_gap_s: float = 0) -> str:
         parts.append(text)
         previous_end = s.end if paragraph_gap_s else None
     return "".join(parts)
+
+
+def _speaker_labels(value) -> list[str]:
+    """`speaker_labels` must be a list of distinct, non-empty names (a bare string would be split into letters)."""
+    if not isinstance(value, (list, tuple)) or not all(isinstance(x, str) and x.strip() for x in value):
+        raise ValueError("diarize.speaker_labels must be a list of non-empty strings")
+    labels = [x.strip() for x in value]
+    if len(set(labels)) != len(labels):
+        raise ValueError("diarize.speaker_labels must not repeat a name")
+    return labels
 
 
 class FasterWhisperSTT:
@@ -66,19 +77,27 @@ class FasterWhisperSTT:
         self._initial_prompt = initial_prompt
         self._condition_on_previous_text = condition_on_previous_text
         self._paragraph_gap_s = paragraph_gap_s
-        # `diarize` = {segmentation, embedding, num_speakers, threads, min_duration_s, max_duration_s,
-        # min_speaker_share}: label speakers (A, B) in recordings between min and max duration. A second
-        # speaker owning less than min_speaker_share of the words is treated as noise (a monologue
-        # that the fixed speaker count split in two). Needs the `diarize` extra.
+        # `diarize` = {segmentation, embedding, num_speakers, threshold, threads, min_duration_s,
+        # max_duration_s, min_speaker_share, speaker_labels, merge}: label speakers (A, B) in recordings between min and max
+        # duration, when the audio really holds a conversation. Speakers owning less than
+        # min_speaker_share of the words are noise and dropped; fewer than two speakers left means plain
+        # text (a voice note by one person). Needs the `diarize` extra.
         self._diarizer: SherpaDiarizer | None = None
         self._diarize_min_s = 120.0
         self._diarize_max_s = 3600.0
         self._min_speaker_share = 0.05
+        self._speaker_labels: list[str] = []
+        self._merge = MergeOptions()
         if diarize:
             options = dict(diarize)
             self._diarize_min_s = float(options.pop("min_duration_s", 120))
             self._diarize_max_s = float(options.pop("max_duration_s", 3600))
             self._min_speaker_share = float(options.pop("min_speaker_share", 0.05))
+            self._speaker_labels = _speaker_labels(options.pop("speaker_labels", []))
+            try:
+                self._merge = MergeOptions(**options.pop("merge", {}))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"diarize.merge: {exc}") from exc
             self._diarizer = SherpaDiarizer(**options)
         self._idle_unload_s = idle_unload_s
         self._model = None
@@ -131,9 +150,20 @@ class FasterWhisperSTT:
         pool.shutdown()
         if turns:
             words = [Word(w.start, w.end, w.word) for s in segments for w in (s.words or [])]
-            shares = speaker_shares(words, turns)
-            if len(shares) > 1 and min(shares.values()) >= self._min_speaker_share:
-                return build_dialogue(words, turns, paragraph_gap_s=self._paragraph_gap_s), info.language, info.duration
+            dialogue = None
+            try:
+                dialogue = build_dialogue(
+                    words,
+                    turns,
+                    min_share=self._min_speaker_share,
+                    paragraph_gap_s=self._paragraph_gap_s,
+                    labels=self._speaker_labels,
+                    options=self._merge,
+                )
+            except Exception:
+                log.exception("speaker merge failed, returning the transcript without speaker labels")
+            if dialogue:
+                return dialogue, info.language, info.duration
         return join_segments(segments, self._paragraph_gap_s), info.language, info.duration
 
     def _arm_unload(self) -> None:

@@ -65,9 +65,11 @@ def _split_text(text: str, limit: int = MAX_TEXT) -> list[str]:
     """Split at a line break or space near the limit, so a long transcript is not cut mid-word."""
     parts: list[str] = []
     while len(text) > limit:
-        cut = max(text.rfind("\n", 0, limit), text.rfind(" ", 0, limit))
-        if cut < limit // 2:
-            cut = limit
+        # prefer a blank line (a paragraph or speaker block), then a line break, then a space
+        cut = next(
+            (c for c in (text.rfind("\n\n", 0, limit), text.rfind("\n", 0, limit), text.rfind(" ", 0, limit)) if c >= limit // 2),
+            limit,
+        )
         parts.append(text[:cut].rstrip())
         text = text[cut:].lstrip()
     return [p for p in (*parts, text) if p.strip()] or [text]
@@ -116,6 +118,7 @@ class OpenWAChannel:
         path: str = "/webhook",
         timeout_s: float = 30.0,
         mark_read: bool = True,
+        part_text: str = "Part {n} of {total}",
     ) -> None:
         import httpx
 
@@ -129,6 +132,13 @@ class OpenWAChannel:
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._server: asyncio.AbstractServer | None = None
         self._mark_read = mark_read
+        try:
+            header = part_text.format(n=99, total=99)  # fail at start, not after a long transcription
+        except (KeyError, IndexError, ValueError, AttributeError) as exc:
+            raise ValueError(f"channel option part_text is not a valid template ({exc!r}); use {{n}} and {{total}}") from exc
+        if len(header) > 64:
+            raise ValueError("channel option part_text is too long (64 characters at most)")
+        self._part_text = part_text
         self._tasks: set[asyncio.Task[None]] = set()
 
     @classmethod
@@ -252,7 +262,11 @@ class OpenWAChannel:
             log.warning("read receipt failed for %s: %s", data.get("id"), exc)
 
     async def reply(self, to: Incoming, text: str) -> None:
-        for part in _split_text(text):
+        parts = _split_text(text)
+        for n, part in enumerate(parts, 1):
+            if len(parts) > 1 and self._part_text:
+                # said in the message itself, so several messages read as one transcript
+                part = f"{self._part_text.format(n=n, total=len(parts))}\n\n{part}"
             resp = await self._client.post(
                 f"{self._base}/messages/send-text",
                 json={"chatId": to.chat_id, "text": part},
